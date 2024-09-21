@@ -1,0 +1,65 @@
+syntax = "proto3";
+package scheduler;
+
+service Builds {
+    rpc CreateBuild(CreateBuildRequest) returns (CreateBuildResponse);
+};
+
+service Workers {
+    rpc RegisterWorker(RegisterWorkerRequest) returns (RegisterWorkerResponse);
+    rpc AcceptBuild(AcceptBuildRequest) returns (AcceptBuildResponse);
+    rpc BuildHeartBeat(BuildHeartBeatRequest) returns (BuildHeartBeatResponse);
+};
+
+message Requirement {
+    string key = 1;
+    string value = 2;
+}
+
+message Resource {
+    string key = 1;
+    string value = 2;
+}
+
+message Build {
+    uint64 id = 1; // Server assigned.
+    repeated Requirement requirements = 2;
+    uint64 sleep_ms = 3;
+};
+
+message Worker {
+    uint64 id = 1; // Server assigned.
+    repeated Resource resources = 2;
+}
+
+message CreateBuildRequest {
+    Build build = 1;
+}
+
+message CreateBuildResponse {
+    uint64 build_id = 1;
+}
+
+message RegisterWorkerRequest {
+    Worker worker = 1;
+}
+
+message RegisterWorkerResponse {
+    uint64 worker_id = 1;
+}
+
+message AcceptBuildRequest {
+    uint64 worker_id = 1;
+}
+
+message AcceptBuildResponse {
+    Build build = 1;
+}
+
+message BuildHeartBeatRequest {
+    uint64 worker_id = 1;
+    uint64 build_id = 2;
+    bool done = 3;
+}
+
+message BuildHeartBeatResponse {}

@@ -1,0 +1,20 @@
+[package]
+name = "scheduler"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "scheduler"
+path = "src/scheduler.rs"
+
+[[bin]]
+name = "worker"
+path = "src/worker.rs"
+
+[dependencies]
+prost = "0.13"
+tokio = { version = "1.40.0", features = ["macros", "rt-multi-thread"] }
+tonic = "0.12.2"
+
+[build-dependencies]
+tonic-build = "0.12.2"
