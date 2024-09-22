@@ -1,5 +1,6 @@
 use tonic::{transport::Server, Request, Response, Status};
 
+use once_cell::sync::Lazy;
 use scheduler::builds_server::{Builds, BuildsServer};
 use scheduler::workers_server::{Workers, WorkersServer};
 use scheduler::{
@@ -7,21 +8,30 @@ use scheduler::{
     RegisterWorkerRequest, RegisterWorkerResponse,
 };
 use scheduler::{CreateBuildRequest, CreateBuildResponse};
+mod queue;
 
 pub mod scheduler {
     tonic::include_proto!("scheduler");
 }
 
-#[derive(Debug, Default)]
-pub struct BuildsService {}
+#[derive(Debug)]
+pub struct BuildsService<'a> {
+    q: &'a queue::Queue,
+}
+
+impl<'a> BuildsService<'a> {
+    fn new(q: &'a queue::Queue) -> Self {
+        BuildsService { q }
+    }
+}
 
 #[tonic::async_trait]
-impl Builds for BuildsService {
+impl Builds for BuildsService<'static> {
     async fn create_build(
         &self,
         request: Request<CreateBuildRequest>,
     ) -> Result<Response<CreateBuildResponse>, Status> {
-        println!("Got a request: {:?}", request);
+        println!("Builds.create_build: {:?}", request);
 
         let resp = CreateBuildResponse { build_id: 1 };
 
@@ -29,16 +39,24 @@ impl Builds for BuildsService {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct WorkersService {}
+#[derive(Debug)]
+pub struct WorkersService<'a> {
+    q: &'a queue::Queue,
+}
+
+impl<'a> WorkersService<'a> {
+    fn new(q: &'a queue::Queue) -> Self {
+        WorkersService { q }
+    }
+}
 
 #[tonic::async_trait]
-impl Workers for WorkersService {
+impl Workers for WorkersService<'static> {
     async fn register_worker(
         &self,
         request: Request<RegisterWorkerRequest>,
     ) -> Result<Response<RegisterWorkerResponse>, Status> {
-        println!("Got a request: {:?}", request);
+        println!("Workers.register_worker: {:?}", request);
 
         let resp = RegisterWorkerResponse { worker_id: 1 };
 
@@ -49,7 +67,7 @@ impl Workers for WorkersService {
         &self,
         request: Request<AcceptBuildRequest>,
     ) -> Result<Response<AcceptBuildResponse>, Status> {
-        println!("Got a request: {:?}", request);
+        println!("Workers.accept_build: {:?}", request);
 
         let resp = AcceptBuildResponse::default();
 
@@ -60,7 +78,7 @@ impl Workers for WorkersService {
         &self,
         request: Request<BuildHeartBeatRequest>,
     ) -> Result<Response<BuildHeartBeatResponse>, Status> {
-        println!("Got a request: {:?}", request);
+        println!("Workers.build_heart_beat: {:?}", request);
 
         let resp = BuildHeartBeatResponse::default();
 
@@ -71,8 +89,9 @@ impl Workers for WorkersService {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = "0.0.0.0:50051".parse()?;
-    let bs = BuildsService::default();
-    let ws = WorkersService::default();
+    static Q: Lazy<queue::Queue> = Lazy::new(queue::Queue::new);
+    let bs = BuildsService::new(&Q);
+    let ws = WorkersService::new(&Q);
     println!("Launching server on {:?}", addr);
     Server::builder()
         .add_service(BuildsServer::new(bs))

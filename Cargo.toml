@@ -12,6 +12,7 @@ name = "worker"
 path = "src/worker.rs"
 
 [dependencies]
+once_cell = "1.19.0"
 prost = "0.13"
 tokio = { version = "1.40.0", features = ["macros", "rt-multi-thread"] }
 tonic = "0.12.2"
