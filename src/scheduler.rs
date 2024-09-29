@@ -1,3 +1,5 @@
+use std::sync::atomic;
+
 use tonic::{transport::Server, Request, Response, Status};
 
 use once_cell::sync::Lazy;
@@ -41,11 +43,15 @@ impl Builds for BuildsService<'static> {
 #[derive(Debug)]
 pub struct WorkersService<'a> {
     q: &'a queue::Queue,
+    next_id: atomic::AtomicU64,
 }
 
 impl<'a> WorkersService<'a> {
     fn new(q: &'a queue::Queue) -> Self {
-        WorkersService { q }
+        WorkersService {
+            q,
+            next_id: 0.into(),
+        }
     }
 }
 
@@ -56,8 +62,9 @@ impl Workers for WorkersService<'static> {
         request: Request<RegisterWorkerRequest>,
     ) -> Result<Response<RegisterWorkerResponse>, Status> {
         println!("Workers.register_worker: {:?}", request);
+        let worker_id = self.next_id.fetch_add(1, atomic::Ordering::Relaxed);
 
-        let resp = RegisterWorkerResponse { worker_id: 1 };
+        let resp = RegisterWorkerResponse { worker_id };
 
         Ok(Response::new(resp)) // Send back our formatted greeting
     }
@@ -67,6 +74,13 @@ impl Workers for WorkersService<'static> {
         request: Request<AcceptBuildRequest>,
     ) -> Result<Response<AcceptBuildResponse>, Status> {
         println!("Workers.accept_build: {:?}", request);
+        let req = request.into_inner();
+        let wid = req.worker_id;
+        if wid >= self.next_id.load(atomic::Ordering::Relaxed) {
+            return Err(Status::invalid_argument(format!(
+                "worker {wid} has not been registered"
+            )));
+        }
 
         let resp = AcceptBuildResponse {
             build: Some(scheduler::Build {
@@ -84,9 +98,15 @@ impl Workers for WorkersService<'static> {
         request: Request<BuildHeartBeatRequest>,
     ) -> Result<Response<BuildHeartBeatResponse>, Status> {
         println!("Workers.build_heart_beat: {:?}", request);
+        let req = request.into_inner();
+        let wid = req.worker_id;
+        if wid >= self.next_id.load(atomic::Ordering::Relaxed) {
+            return Err(Status::invalid_argument(format!(
+                "worker {wid} has not been registered"
+            )));
+        }
 
         let resp = BuildHeartBeatResponse::default();
-
         Ok(Response::new(resp)) // Send back our formatted greeting
     }
 }

@@ -13,7 +13,7 @@ struct Runner {
 
 impl Runner {
     async fn new(client: &mut WorkersClient<Channel>) -> Result<Self> {
-        let w = scheduler::Worker {
+        let mut w = scheduler::Worker {
             id: 0,
             resources: vec![
                 scheduler::Resource {
@@ -34,6 +34,7 @@ impl Runner {
             .with_context(|| "failed to register worker")?
             .into_inner();
         println!("Registered worker {}: {:?}", reg.worker_id, w);
+        w.id = reg.worker_id;
         Ok(Runner { proto: w })
     }
 
@@ -71,14 +72,15 @@ impl Runner {
         }
     }
 
-    async fn run(&self, client: &mut WorkersClient<Channel>) {
-        println!("Starting runner {}.", self.proto.id);
+    async fn run(&self, client: &mut WorkersClient<Channel>) -> Result<()> {
+        println!("Starting runner {}.", self.id());
         let mut idle_iterations: u64 = 0;
         loop {
             if idle_iterations > 10 && idle_iterations % 10 == 0 {
                 println!(
                     "Runner {} idle for {} iterations.",
-                    self.proto.id, idle_iterations
+                    self.id(),
+                    idle_iterations
                 );
             }
             let should_sleep;
@@ -94,11 +96,26 @@ impl Runner {
                 Ok(result) => {
                     match result {
                         Err(err) => {
-                            should_sleep = true;
-                            println!(
-                                "Runner {} encountered error accepting build: {err}",
-                                self.id()
-                            );
+                            match err.code() {
+                                tonic::Code::FailedPrecondition
+                                | tonic::Code::InvalidArgument
+                                | tonic::Code::NotFound
+                                | tonic::Code::OutOfRange
+                                | tonic::Code::PermissionDenied
+                                | tonic::Code::Unimplemented => {
+                                    anyhow::bail!(
+                                        "runner {} aborting due to unrecoverable error: {err}",
+                                        self.id()
+                                    );
+                                }
+                                _ => {
+                                    should_sleep = true;
+                                    println!(
+                                        "Runner {} encountered error accepting build: {err}",
+                                        self.id()
+                                    );
+                                }
+                            };
                         }
                         Ok(resp) => {
                             idle_iterations = 0;
@@ -121,7 +138,7 @@ async fn send_heartbeat(
     client: &mut WorkersClient<Channel>,
     build_id: u64,
     done: bool,
-) {
+) -> Result<()> {
     if let Err(err) = client
         .build_heart_beat(scheduler::BuildHeartBeatRequest {
             build_id,
@@ -130,8 +147,16 @@ async fn send_heartbeat(
         })
         .await
     {
-        println!("Runner {runner_id} failed to send heartbeat with done={done} for build {build_id}: {err}");
+        match err.code() {
+            tonic::Code::FailedPrecondition | tonic::Code::InvalidArgument => {
+                anyhow::bail!("runner {runner_id} heartbeat task for build {build_id} encountered unrecoverable error: {err}");
+            }
+            _ => {
+                println!("Runner {runner_id} failed to send heartbeat with done={done} for build {build_id}: {err}");
+            }
+        }
     }
+    Ok(())
 }
 
 async fn build_heartbeats(
@@ -145,41 +170,68 @@ async fn build_heartbeats(
             .await
             .is_err()
         {
-            send_heartbeat(runner_id, &mut client, b.id, false).await;
+            if let Err(err) = send_heartbeat(runner_id, &mut client, b.id, false).await {
+                println!(
+                    "Aborting heartbeats for build {} in runner {runner_id} due to unrecoverable error: {err:?}",
+                    b.id
+                );
+                return;
+            }
             continue;
         }
         // Received build completion signal on rx.
         break;
     }
-    send_heartbeat(runner_id, &mut client, b.id, true).await;
+    if let Err(err) = send_heartbeat(runner_id, &mut client, b.id, true).await {
+        println!(
+            "Unrecoverable error sending completion heartbeat for build {} in runner {runner_id}: {err:?}",
+            b.id
+        );
+    }
 }
 
 async fn sleep_seconds(secs: u64) {
     tokio::time::sleep(tokio::time::Duration::from_secs(secs)).await
 }
 
-async fn launch_new_runner() -> Result<()> {
+async fn launch_new_runner(task_id: i32) -> Result<()> {
     let mut client = WorkersClient::connect("http://localhost:50051")
         .await
         .with_context(|| "failed to connect to Workers service")?;
     let r = Runner::new(&mut client)
         .await
         .with_context(|| "failed to initialize runner")?;
-    r.run(&mut client).await;
-    println!("Runner {} is shutting down.", r.proto.id);
+    r.run(&mut client)
+        .await
+        .with_context(|| format!("runner {} exited with error", r.id()))?;
+    println!(
+        "Runner {} in runner task {task_id} is shutting down.",
+        r.id()
+    );
     Ok(())
+}
+
+async fn runner_task(task_id: i32) {
+    loop {
+        println!("Runner task {task_id} launching new runner.");
+        if let Err(err) = launch_new_runner(task_id).await {
+            println!("Runner in runner task {task_id} exited with error: {err:?}");
+        } else {
+            println!("Runner in runner task {task_id} exited without error.");
+        }
+        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let workers = 1;
     let mut js = tokio::task::JoinSet::new();
-    for _ in 0..workers {
-        js.spawn(launch_new_runner());
+    for i in 0..workers {
+        js.spawn(runner_task(i));
     }
     while let Some(r) = js.join_next().await {
-        r.with_context(|| "runner crashed")?
-            .with_context(|| "runner exited with error")?;
+        r.with_context(|| "runner crashed")?;
     }
 
     Ok(())
