@@ -32,7 +32,6 @@ impl Builds for BuildsService<'static> {
         request: Request<CreateBuildRequest>,
     ) -> Result<Response<CreateBuildResponse>, Status> {
         println!("Builds.create_build: {:?}", request);
-
         let resp = CreateBuildResponse { build_id: 1 };
 
         Ok(Response::new(resp)) // Send back our formatted greeting
@@ -69,7 +68,13 @@ impl Workers for WorkersService<'static> {
     ) -> Result<Response<AcceptBuildResponse>, Status> {
         println!("Workers.accept_build: {:?}", request);
 
-        let resp = AcceptBuildResponse::default();
+        let resp = AcceptBuildResponse {
+            build: Some(scheduler::Build {
+                id: 1,
+                requirements: vec![],
+                sleep_ms: 10000,
+            }),
+        };
 
         Ok(Response::new(resp)) // Send back our formatted greeting
     }
