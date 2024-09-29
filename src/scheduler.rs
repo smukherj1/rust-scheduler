@@ -1,7 +1,7 @@
 use std::sync::atomic;
 
-use tonic::{transport::Server, Request, Response, Status};
-
+use anyhow::{Context, Result};
+use clap::Parser;
 use once_cell::sync::Lazy;
 use scheduler::builds_server::{Builds, BuildsServer};
 use scheduler::workers_server::{Workers, WorkersServer};
@@ -10,10 +10,19 @@ use scheduler::{
     RegisterWorkerRequest, RegisterWorkerResponse,
 };
 use scheduler::{CreateBuildRequest, CreateBuildResponse};
+use tonic::{transport::Server, Request, Response, Status};
 mod queue;
 
 pub mod scheduler {
     tonic::include_proto!("scheduler");
+}
+
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    /// URL for the address this scheduler GRPC server will serve at.
+    #[arg(short, long)]
+    address: String,
 }
 
 #[derive(Debug)]
@@ -112,9 +121,21 @@ impl Workers for WorkersService<'static> {
     }
 }
 
+fn validate_args(args: &Args) -> Result<()> {
+    if args.address.is_empty() {
+        anyhow::bail!("address flag can't be empty");
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let addr = "0.0.0.0:50051".parse()?;
+    let args = Args::parse();
+    validate_args(&args).with_context(|| "failed to validate command line arguments")?;
+    let addr = args
+        .address
+        .parse()
+        .with_context(|| format!("failed to parse {} as a socker address", args.address))?;
     static Q: Lazy<queue::Queue> = Lazy::new(queue::Queue::new);
     let bs = BuildsService::new(&Q);
     let ws = WorkersService::new(&Q);
