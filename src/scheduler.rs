@@ -33,7 +33,7 @@ impl Builds for BuildsService<'static> {
         &self,
         request: Request<CreateBuildRequest>,
     ) -> Result<Response<CreateBuildResponse>, Status> {
-        println!("Builds.create_build: {:?}", request);
+        println!("Builds.create_build: {:?}", request.into_inner());
         let resp = CreateBuildResponse { build_id: 1 };
 
         Ok(Response::new(resp)) // Send back our formatted greeting
@@ -61,7 +61,8 @@ impl Workers for WorkersService<'static> {
         &self,
         request: Request<RegisterWorkerRequest>,
     ) -> Result<Response<RegisterWorkerResponse>, Status> {
-        println!("Workers.register_worker: {:?}", request);
+        let req = request.into_inner();
+        println!("Workers.register_worker: {:?}", req);
         let worker_id = self.next_id.fetch_add(1, atomic::Ordering::Relaxed);
 
         let resp = RegisterWorkerResponse { worker_id };
@@ -73,8 +74,8 @@ impl Workers for WorkersService<'static> {
         &self,
         request: Request<AcceptBuildRequest>,
     ) -> Result<Response<AcceptBuildResponse>, Status> {
-        println!("Workers.accept_build: {:?}", request);
         let req = request.into_inner();
+        println!("Workers.accept_build: {:?}", req);
         let wid = req.worker_id;
         if wid >= self.next_id.load(atomic::Ordering::Relaxed) {
             return Err(Status::invalid_argument(format!(
@@ -97,8 +98,8 @@ impl Workers for WorkersService<'static> {
         &self,
         request: Request<BuildHeartBeatRequest>,
     ) -> Result<Response<BuildHeartBeatResponse>, Status> {
-        println!("Workers.build_heart_beat: {:?}", request);
         let req = request.into_inner();
+        println!("Workers.build_heart_beat: {:?}", req);
         let wid = req.worker_id;
         if wid >= self.next_id.load(atomic::Ordering::Relaxed) {
             return Err(Status::invalid_argument(format!(

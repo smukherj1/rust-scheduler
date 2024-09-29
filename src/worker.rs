@@ -1,9 +1,23 @@
 use anyhow::{Context, Result};
+use clap::Parser;
 use scheduler::workers_client::WorkersClient;
+use std::sync::Arc;
 use tonic::transport::Channel;
 
 pub mod scheduler {
     tonic::include_proto!("scheduler");
+}
+
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    /// URL for the scheduler GRPC server.
+    #[arg(short, long)]
+    scheduler_addr: String,
+
+    /// Number of worker tasks to spawn.
+    #[arg(short, long, default_value_t = 1)]
+    workers: i32,
 }
 
 #[derive(Debug)]
@@ -194,10 +208,15 @@ async fn sleep_seconds(secs: u64) {
     tokio::time::sleep(tokio::time::Duration::from_secs(secs)).await
 }
 
-async fn launch_new_runner(task_id: i32) -> Result<()> {
-    let mut client = WorkersClient::connect("http://localhost:50051")
+async fn launch_new_runner(task_id: i32, args: &Args) -> Result<()> {
+    let mut client = WorkersClient::connect(args.scheduler_addr.clone())
         .await
-        .with_context(|| "failed to connect to Workers service")?;
+        .with_context(|| {
+            format!(
+                "failed to connect to Workers service at address {}",
+                args.scheduler_addr
+            )
+        })?;
     let r = Runner::new(&mut client)
         .await
         .with_context(|| "failed to initialize runner")?;
@@ -211,10 +230,10 @@ async fn launch_new_runner(task_id: i32) -> Result<()> {
     Ok(())
 }
 
-async fn runner_task(task_id: i32) {
+async fn runner_task(args: Arc<Args>, task_id: i32) {
     loop {
         println!("Runner task {task_id} launching new runner.");
-        if let Err(err) = launch_new_runner(task_id).await {
+        if let Err(err) = launch_new_runner(task_id, &args).await {
             println!("Runner in runner task {task_id} exited with error: {err:?}");
         } else {
             println!("Runner in runner task {task_id} exited without error.");
@@ -223,12 +242,30 @@ async fn runner_task(task_id: i32) {
     }
 }
 
+fn validate_args(args: &Args) -> Result<()> {
+    if args.workers < 1 {
+        anyhow::bail!(
+            "invalid value for option workers, got {}, want >= 1",
+            args.workers
+        );
+    }
+    if args.scheduler_addr.is_empty() {
+        anyhow::bail!("option scheduler flag can't be empty");
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let workers = 1;
+    let args = Arc::new(Args::parse());
+    validate_args(&args).with_context(|| "error validating command line arguments")?;
     let mut js = tokio::task::JoinSet::new();
-    for i in 0..workers {
-        js.spawn(runner_task(i));
+    println!(
+        "Launching {} workers for scheduler at {}.",
+        args.workers, args.scheduler_addr
+    );
+    for i in 0..args.workers {
+        js.spawn(runner_task(Arc::clone(&args), i));
     }
     while let Some(r) = js.join_next().await {
         r.with_context(|| "runner crashed")?;
