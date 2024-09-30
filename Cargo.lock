@@ -852,6 +852,7 @@ dependencies = [
  "clap",
  "once_cell",
  "prost",
+ "rand",
  "tokio",
  "tonic",
  "tonic-build",
