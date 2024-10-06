@@ -1,8 +1,9 @@
-use std::sync::atomic;
+mod queue;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use once_cell::sync::Lazy;
+use queue::scheduler;
 use scheduler::builds_server::{Builds, BuildsServer};
 use scheduler::workers_server::{Workers, WorkersServer};
 use scheduler::{
@@ -10,12 +11,8 @@ use scheduler::{
     RegisterWorkerRequest, RegisterWorkerResponse,
 };
 use scheduler::{CreateBuildRequest, CreateBuildResponse};
+use std::sync::atomic;
 use tonic::{transport::Server, Request, Response, Status};
-mod queue;
-
-pub mod scheduler {
-    tonic::include_proto!("scheduler");
-}
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -25,7 +22,6 @@ struct Args {
     address: String,
 }
 
-#[derive(Debug)]
 pub struct BuildsService<'a> {
     q: &'a queue::Queue,
 }
@@ -42,14 +38,19 @@ impl Builds for BuildsService<'static> {
         &self,
         request: Request<CreateBuildRequest>,
     ) -> Result<Response<CreateBuildResponse>, Status> {
-        println!("Builds.create_build: {:?}", request.into_inner());
-        let resp = CreateBuildResponse { build_id: 1 };
+        let b = request
+            .into_inner()
+            .build
+            .ok_or(tonic::Status::invalid_argument(
+                "field build can't be missing in create_build",
+            ))?;
+        let build_id = self.q.create_build(b)?;
+        let resp = CreateBuildResponse { build_id };
 
         Ok(Response::new(resp)) // Send back our formatted greeting
     }
 }
 
-#[derive(Debug)]
 pub struct WorkersService<'a> {
     q: &'a queue::Queue,
     next_id: atomic::AtomicU64,

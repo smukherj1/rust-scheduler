@@ -1,0 +1,94 @@
+/*
+ * Builds - map[build id] -> Build
+ * Workers - map[worker id] -> Worker
+ * Build
+ *  - id (u64)
+ *  - bsid (u128)
+ *  - requirements (vec<(key, value)>)
+ *  - created (time)
+ *  - assigned (time)
+ *  - assigned_worker (u64)
+ *  - last_heartbeat (time)
+ *  - status (Status)
+ *  - tx (Optional mpsc channel sender <()>)
+ * Worker
+ *  - id (u64)
+ *  - wsid (u128)
+ *  - registered (time)
+ *  - last_seen (time)
+ *  - tx (Option sender the worker may be waiting on)
+ * BuildSet
+ *  - id (u128)
+ *  - active_builds (u64)
+ *  - requirements (vec<(key, value)>)
+ *  - queue (deque<build id>)
+ *  - worker_set_ids (vec<u128>)
+ * WorkerSet
+ *  - id (u128)
+ *  - active_workers (u64)
+ *  - resources (vec<(key, value)>)
+ *  - waiting_worker_ids (vec<u64>) //  Workers *possibly* waiting.
+ *  - build_set_ids (vec<u128>) // Compatible build sets
+ * BuildSets - map[u128] -> BuildSet
+ * WorkerSets - map[u128] -> WorkerSet
+ *
+ * create_build(build)
+ *   Incr atomic build counter for build ID
+ *   builds.lock()
+ *   add build to builds
+ *   buildsets.lock()
+ *   bs = get or create buildset for build
+ *   build.bsid = bs.id
+ *   bs.active_builds += 1
+ *   workersets.lock()
+ *   workers.lock()
+ *   for wsid in bs.worker_set_ids:
+ *     ws = workersets[wsid]
+ *     for wid in ws.waiting_worker_ids.pop():
+ *       w = workers[wid]
+ *       if w.tx.try_send(build):
+ *         # Successful assignment
+ *         build.assign_time = now()
+ *         build.assigned_worker = wid
+ *    # No available workers to assign to
+ *    bs.queue.push(build)
+ *
+ * wait_build(build) -> enum(build or rx)
+ *   builds.lock()
+ *   b = builds[build.id]
+ *   if b.done:
+ *     return b
+ *   b.tx, rx = channel.new()
+ *   return rx
+ *
+ * assign_build(worker_id) -> enum(build or rx)
+ *   builds.lock()
+ *   buildsets.lock()
+ *   workersets.lock()
+ *   workers.lock()
+ *   w = workers[worker_id]
+ *   for bsid in workersets[w.wsid].build_set_ids:
+ *     bs = buildsets[bsid]
+ *     if bs.queue.empty():
+ *       continue
+ *     bid = bs.queue.pop()
+ *     assign build "bid" to w and return it
+ *   # No pending build. Mark self as
+ *   ws = workersets[w.wsid]
+ *   Flush non-waiting workers from waiting_worker_ids
+ *   ws.waiting_worker_ids.push(worker_id)
+ *   w.tx, rx = channel.new()
+ *   return rx
+ *
+ * register_worker(worker) -> wid
+ *   wid = incr atomic worker counter
+ *   workersets.lock()
+ *   ws = get or create worker set
+ *   ws.active_workers += 1
+ *   workersets.unlock()
+ *   workers.lock()
+ *   workers[wid] = worker
+ *
+ * build_heartbeat(wid, bid, done)
+ *
+ */
