@@ -28,15 +28,15 @@ struct Build {
 
 struct Worker {
     wsid: WorkerSetId,
-    registered_at: Option<tokio::time::Instant>,
-    last_heartbeat_at: Option<tokio::time::Instant>,
-    tx: Option<tokio::sync::oneshot::Sender<()>>,
+    registered_at: tokio::time::Instant,
+    last_heartbeat_at: tokio::time::Instant,
+    tx: Option<tokio::sync::oneshot::Sender<u64>>,
     assigned_build: Option<u64>,
 }
 
 struct BuildSet {
     requirements: Constraints,
-    queue: VecDeque<scheduler::Build>,
+    queue: VecDeque<u64>,
     worker_set_ids: Vec<WorkerSetId>,
 }
 
@@ -56,7 +56,7 @@ pub struct Queue {
 }
 
 fn req_into_constraints(req: &[scheduler::Requirement]) -> Constraints {
-    req.into_iter()
+    req.iter()
         .map(|v| (v.key.clone(), v.value.clone()))
         .collect()
 }
@@ -119,6 +119,35 @@ fn get_or_create_build_set<'a>(
     Ok((bsid, bs))
 }
 
+fn try_assign_build(
+    build_id: u64,
+    bs: &BuildSet,
+    workersets: &mut HashMap<WorkerSetId, WorkerSet>,
+    workers: &mut HashMap<u64, Worker>,
+) -> Option<u64> {
+    for wsid in bs.worker_set_ids.iter() {
+        let ws = if let Some(ws) = workersets.get_mut(wsid) {
+            ws
+        } else {
+            println!("ERROR: Found non-existent worker set in build set while trying to assign build {build_id}: worker_set {wsid:?}");
+            continue;
+        };
+        while let Some(wid) = ws.waiting_worker_ids.pop_front() {
+            let w = if let Some(w) = workers.get_mut(&wid) {
+                w
+            } else {
+                println!("ERROR: Found invalid worker ID {wid} in worker set {wsid:?} while trying to assign build {build_id}");
+                continue;
+            };
+            if !w.try_assign_build(build_id) {
+                continue;
+            }
+            return Some(wid);
+        }
+    }
+    None
+}
+
 impl BuildSet {
     fn add_compatible_worker_sets(
         &mut self,
@@ -138,6 +167,23 @@ impl BuildSet {
             ));
         }
         Ok(())
+    }
+}
+
+impl Worker {
+    fn expired(&self) -> bool {
+        self.last_heartbeat_at.elapsed() > tokio::time::Duration::from_secs(5 * 60)
+    }
+
+    fn try_assign_build(&mut self, build_id: u64) -> bool {
+        if let Some(tx) = self.tx.take() {
+            if tx.send(build_id).is_err() {
+                return false;
+            }
+            self.assigned_build = Some(build_id);
+            return true;
+        }
+        false
     }
 }
 
@@ -164,6 +210,16 @@ impl Queue {
                 "detected panic while trying to grab scheduler worker set lock: {err:?}"
             ))
         })?;
+        let mut builds = self.builds.lock().map_err(|err| {
+            tonic::Status::internal(format!(
+                "detected panic while trying to grab scheduler builds lock: {err:?}"
+            ))
+        })?;
+        let mut workers = self.workers.lock().map_err(|err| {
+            tonic::Status::internal(format!(
+                "detected panic while trying to grab scheduler workers lock: {err:?}"
+            ))
+        })?;
         let (bsid, bs) =
             get_or_create_build_set(&mut buildsets, &mut workersets, &sbuild.requirements)?;
         let build_id = self.next_build_id.fetch_add(1, Ordering::Relaxed);
@@ -177,6 +233,14 @@ impl Queue {
             tx: None,
             proto: sbuild,
         };
+        if let Some(worker_id) = try_assign_build(build_id, bs, &mut workersets, &mut workers) {
+            build.assigned_at = Some(tokio::time::Instant::now());
+            build.last_heartbeat_at = Some(tokio::time::Instant::now());
+            build.assigned_worker = Some(worker_id);
+        } else {
+            bs.queue.push_back(build_id);
+        }
+        builds.insert(build_id, build);
         Ok(build_id)
     }
 }
