@@ -72,7 +72,10 @@ impl Workers for WorkersService<'static> {
         request: Request<RegisterWorkerRequest>,
     ) -> Result<Response<RegisterWorkerResponse>, Status> {
         let req = request.into_inner();
-        println!("Workers.register_worker: {:?}", req);
+        let worker = match req.worker {
+            None => return Err(tonic::Status::invalid_argument("missing field: worker")),
+            Some(w) => w,
+        };
         let worker_id = self.next_id.fetch_add(1, atomic::Ordering::Relaxed);
 
         let resp = RegisterWorkerResponse { worker_id };

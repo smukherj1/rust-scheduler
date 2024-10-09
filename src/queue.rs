@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, VecDeque},
     io::Write,
-    sync::{atomic::Ordering, Mutex},
+    sync::{atomic::Ordering, Mutex, MutexGuard},
 };
 
 pub mod scheduler {
@@ -61,7 +61,7 @@ fn req_into_constraints(req: &[scheduler::Requirement]) -> Constraints {
         .collect()
 }
 
-fn res_into_constraints(res: &[scheduler::Requirement]) -> Constraints {
+fn res_into_constraints(res: &[scheduler::Resource]) -> Constraints {
     res.into_iter()
         .map(|v| (v.key.clone(), v.value.clone()))
         .collect()
@@ -119,6 +119,33 @@ fn get_or_create_build_set<'a>(
     Ok((bsid, bs))
 }
 
+fn get_or_create_worker_set<'a>(
+    workersets: &'a mut HashMap<WorkerSetId, WorkerSet>,
+    buildsets: &mut HashMap<BuildSetID, BuildSet>,
+    res: &[scheduler::Resource],
+) -> Result<(WorkerSetId, &'a mut WorkerSet), tonic::Status> {
+    let cons = res_into_constraints(res);
+    let wsid = setid_from_constraints(&cons).map_err(|err| {
+        tonic::Status::internal(format!(
+            "error generating a fingerprint for worker resources: {err:?}"
+        ))
+    })?;
+    let mut inserted = false;
+    let ws = workersets.entry(wsid).or_insert_with(|| {
+        inserted = true;
+        WorkerSet {
+            resources: cons,
+            waiting_worker_ids: VecDeque::new(),
+            build_set_ids: Vec::new(),
+        }
+    });
+
+    if inserted {
+        ws.add_compatible_build_sets(&wsid, buildsets);
+    }
+    Ok((wsid, ws))
+}
+
 fn try_assign_build(
     build_id: u64,
     bs: &BuildSet,
@@ -170,6 +197,22 @@ impl BuildSet {
     }
 }
 
+impl WorkerSet {
+    fn add_compatible_build_sets(
+        &mut self,
+        wsid: &WorkerSetId,
+        buildsets: &mut HashMap<BuildSetID, BuildSet>,
+    ) {
+        for (bsid, bs) in buildsets.iter_mut() {
+            if !is_compatible(&bs.requirements, &self.resources) {
+                continue;
+            }
+            self.build_set_ids.push(*bsid);
+            bs.worker_set_ids.push(*wsid);
+        }
+    }
+}
+
 impl Worker {
     fn expired(&self) -> bool {
         self.last_heartbeat_at.elapsed() > tokio::time::Duration::from_secs(5 * 60)
@@ -187,6 +230,13 @@ impl Worker {
     }
 }
 
+type QueueLocks<'a> = (
+    MutexGuard<'a, HashMap<BuildSetID, BuildSet>>,
+    MutexGuard<'a, HashMap<WorkerSetId, WorkerSet>>,
+    MutexGuard<'a, HashMap<u64, Build>>,
+    MutexGuard<'a, HashMap<u64, Worker>>,
+);
+
 impl Queue {
     pub fn new() -> Self {
         Queue {
@@ -199,27 +249,32 @@ impl Queue {
         }
     }
 
-    pub fn create_build(&self, sbuild: scheduler::Build) -> Result<u64, tonic::Status> {
-        let mut buildsets = self.buildsets.lock().map_err(|err| {
+    fn grab_locks(&self) -> Result<QueueLocks<'_>, tonic::Status> {
+        let buildsets = self.buildsets.lock().map_err(|err| {
             tonic::Status::internal(format!(
                 "detected panic while trying to grab scheduler build set lock: {err:?}"
             ))
         })?;
-        let mut workersets = self.workersets.lock().map_err(|err| {
+        let workersets = self.workersets.lock().map_err(|err| {
             tonic::Status::internal(format!(
                 "detected panic while trying to grab scheduler worker set lock: {err:?}"
             ))
         })?;
-        let mut builds = self.builds.lock().map_err(|err| {
+        let builds = self.builds.lock().map_err(|err| {
             tonic::Status::internal(format!(
                 "detected panic while trying to grab scheduler builds lock: {err:?}"
             ))
         })?;
-        let mut workers = self.workers.lock().map_err(|err| {
+        let workers = self.workers.lock().map_err(|err| {
             tonic::Status::internal(format!(
                 "detected panic while trying to grab scheduler workers lock: {err:?}"
             ))
         })?;
+        Ok((buildsets, workersets, builds, workers))
+    }
+
+    pub fn create_build(&self, sbuild: scheduler::Build) -> Result<u64, tonic::Status> {
+        let (mut buildsets, mut workersets, mut builds, mut workers) = self.grab_locks()?;
         let (bsid, bs) =
             get_or_create_build_set(&mut buildsets, &mut workersets, &sbuild.requirements)?;
         let build_id = self.next_build_id.fetch_add(1, Ordering::Relaxed);
@@ -242,6 +297,23 @@ impl Queue {
         }
         builds.insert(build_id, build);
         Ok(build_id)
+    }
+
+    pub fn register_worker(&self, res: &[scheduler::Resource]) -> Result<u64, tonic::Status> {
+        let (mut buildsets, mut workersets, mut builds, mut workers) = self.grab_locks()?;
+        let (wsid, ws) = get_or_create_worker_set(&mut workersets, &mut buildsets, res)?;
+        let worker_id = self.next_worker_id.fetch_add(1, Ordering::Relaxed);
+        workers.insert(
+            worker_id,
+            Worker {
+                wsid,
+                registered_at: tokio::time::Instant::now(),
+                last_heartbeat_at: tokio::time::Instant::now(),
+                tx: None,
+                assigned_build: None,
+            },
+        );
+        Ok(worker_id)
     }
 }
 
