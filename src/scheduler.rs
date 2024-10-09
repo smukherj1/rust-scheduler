@@ -53,15 +53,11 @@ impl Builds for BuildsService<'static> {
 
 pub struct WorkersService<'a> {
     q: &'a queue::Queue,
-    next_id: atomic::AtomicU64,
 }
 
 impl<'a> WorkersService<'a> {
     fn new(q: &'a queue::Queue) -> Self {
-        WorkersService {
-            q,
-            next_id: 0.into(),
-        }
+        WorkersService { q }
     }
 }
 
@@ -72,56 +68,32 @@ impl Workers for WorkersService<'static> {
         request: Request<RegisterWorkerRequest>,
     ) -> Result<Response<RegisterWorkerResponse>, Status> {
         let req = request.into_inner();
-        let worker = match req.worker {
-            None => return Err(tonic::Status::invalid_argument("missing field: worker")),
-            Some(w) => w,
-        };
-        let worker_id = self.next_id.fetch_add(1, atomic::Ordering::Relaxed);
+        let worker = req
+            .worker
+            .ok_or_else(|| Status::invalid_argument("missing field: worker"))?;
+        let worker_id = self.q.register_worker(&worker.resources).map_err(|err| {
+            Status::new(err.code(), format!("unable to register worker: {err:?}"))
+        })?;
 
         let resp = RegisterWorkerResponse { worker_id };
 
-        Ok(Response::new(resp)) // Send back our formatted greeting
+        Ok(Response::new(resp))
     }
 
     async fn accept_build(
         &self,
         request: Request<AcceptBuildRequest>,
     ) -> Result<Response<AcceptBuildResponse>, Status> {
-        let req = request.into_inner();
-        println!("Workers.accept_build: {:?}", req);
-        let wid = req.worker_id;
-        if wid >= self.next_id.load(atomic::Ordering::Relaxed) {
-            return Err(Status::invalid_argument(format!(
-                "worker {wid} has not been registered"
-            )));
-        }
-
-        let resp = AcceptBuildResponse {
-            build: Some(scheduler::Build {
-                id: 1,
-                requirements: vec![],
-                sleep_ms: 10000,
-            }),
-        };
-
-        Ok(Response::new(resp)) // Send back our formatted greeting
+        Err(tonic::Status::unimplemented("AcceptBuild not implemented"))
     }
 
     async fn build_heart_beat(
         &self,
         request: Request<BuildHeartBeatRequest>,
     ) -> Result<Response<BuildHeartBeatResponse>, Status> {
-        let req = request.into_inner();
-        println!("Workers.build_heart_beat: {:?}", req);
-        let wid = req.worker_id;
-        if wid >= self.next_id.load(atomic::Ordering::Relaxed) {
-            return Err(Status::invalid_argument(format!(
-                "worker {wid} has not been registered"
-            )));
-        }
-
-        let resp = BuildHeartBeatResponse::default();
-        Ok(Response::new(resp)) // Send back our formatted greeting
+        Err(tonic::Status::unimplemented(
+            "BuildHeartBeat not implemented",
+        ))
     }
 }
 
