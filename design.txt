@@ -90,5 +90,16 @@
  *   workers[wid] = worker
  *
  * build_heartbeat(wid, bid, done)
+ *   w = workers[wid]
+ *   b = builds[bid]
+ *   if b.assigned_worker != wid: return error
+ *   if w.build_id != bid: return error
+ *   b.last_heartbeat = now
+ *   w.last_heartbeat = now
+ *   
+ *
+ * wait_build(bid)
+ *
+ * gc()
  *
  */

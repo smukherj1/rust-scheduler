@@ -8,10 +8,9 @@ use scheduler::builds_server::{Builds, BuildsServer};
 use scheduler::workers_server::{Workers, WorkersServer};
 use scheduler::{
     AcceptBuildRequest, AcceptBuildResponse, BuildHeartBeatRequest, BuildHeartBeatResponse,
-    RegisterWorkerRequest, RegisterWorkerResponse,
+    RegisterWorkerRequest, RegisterWorkerResponse, WaitBuildRequest, WaitBuildResponse,
 };
 use scheduler::{CreateBuildRequest, CreateBuildResponse};
-use std::sync::atomic;
 use tonic::{transport::Server, Request, Response, Status};
 
 #[derive(Parser, Debug)]
@@ -49,6 +48,26 @@ impl Builds for BuildsService<'static> {
 
         Ok(Response::new(resp)) // Send back our formatted greeting
     }
+
+    async fn wait_build(
+        &self,
+        request: Request<WaitBuildRequest>,
+    ) -> Result<Response<WaitBuildResponse>, Status> {
+        let req = request.into_inner();
+        let resp = self
+            .q
+            .wait_build(req.build_id)
+            .map_err(|err| Status::new(err.code(), format!("error waiting for build: {err:?}")))?;
+        let build = match resp {
+            queue::BuildResponse::Build(b) => b,
+            queue::BuildResponse::WaitChannel(rx) => rx.await.map_err(|err| {
+                Status::internal(format!(
+                    "error receiving build from scheduler queue: {err:?}"
+                ))
+            })?,
+        };
+        Ok(Response::new(WaitBuildResponse { build: Some(build) }))
+    }
 }
 
 pub struct WorkersService<'a> {
@@ -84,16 +103,38 @@ impl Workers for WorkersService<'static> {
         &self,
         request: Request<AcceptBuildRequest>,
     ) -> Result<Response<AcceptBuildResponse>, Status> {
-        Err(tonic::Status::unimplemented("AcceptBuild not implemented"))
+        let req = request.into_inner();
+        let resp = self.q.accept_build(req.worker_id).map_err(|err| {
+            Status::new(
+                err.code(),
+                format!("error accepting build for worker: {err:?}"),
+            )
+        })?;
+        let build = match resp {
+            queue::BuildResponse::Build(b) => b,
+            queue::BuildResponse::WaitChannel(rx) => rx.await.map_err(|err| {
+                Status::internal(format!(
+                    "error receiving build for worker from scheduler queue: {err:?}"
+                ))
+            })?,
+        };
+        Ok(Response::new(AcceptBuildResponse { build: Some(build) }))
     }
 
     async fn build_heart_beat(
         &self,
         request: Request<BuildHeartBeatRequest>,
     ) -> Result<Response<BuildHeartBeatResponse>, Status> {
-        Err(tonic::Status::unimplemented(
-            "BuildHeartBeat not implemented",
-        ))
+        let req = request.into_inner();
+        self.q
+            .build_heartbeat(req.worker_id, req.build_id, req.done)
+            .map_err(|err| {
+                Status::new(
+                    err.code(),
+                    format!("error accepting heartbeat for build: {err:?}"),
+                )
+            })?;
+        Ok(Response::new(BuildHeartBeatResponse {}))
     }
 }
 

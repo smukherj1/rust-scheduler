@@ -3,6 +3,7 @@ package scheduler;
 
 service Builds {
     rpc CreateBuild(CreateBuildRequest) returns (CreateBuildResponse);
+    rpc WaitBuild(WaitBuildRequest) returns (WaitBuildResponse);
 };
 
 service Workers {
@@ -38,6 +39,14 @@ message CreateBuildRequest {
 
 message CreateBuildResponse {
     uint64 build_id = 1;
+}
+
+message WaitBuildRequest {
+    uint64 build_id = 1;
+}
+
+message WaitBuildResponse {
+    Build build = 1;
 }
 
 message RegisterWorkerRequest {
