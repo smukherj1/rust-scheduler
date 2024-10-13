@@ -67,7 +67,7 @@ fn req_into_constraints(req: &[scheduler::Requirement]) -> Constraints {
 }
 
 fn res_into_constraints(res: &[scheduler::Resource]) -> Constraints {
-    res.into_iter()
+    res.iter()
         .map(|v| (v.key.clone(), v.value.clone()))
         .collect()
 }
@@ -172,7 +172,14 @@ fn try_assign_build(
                 println!("ERROR: Found invalid worker ID {wid} in worker set {wsid:?} while trying to assign build {build_id}");
                 continue;
             };
-            if !w.try_assign_build(build) {
+            let assigned = match w.try_assign_build(build) {
+                Ok(a) => a,
+                Err(err) => {
+                    println!("ERROR: Unable to assign build {build_id} to worker {wid} in worker set {wsid:?}: {err:?}");
+                    continue;
+                }
+            };
+            if !assigned {
                 continue;
             }
             return Some(wid);
@@ -233,20 +240,39 @@ impl Worker {
         self.last_heartbeat_at.elapsed() > tokio::time::Duration::from_secs(5 * 60)
     }
 
-    fn try_assign_build(&mut self, build: &scheduler::Build) -> bool {
+    fn check_assignment(&self, build_id: u64) -> Result<(), tonic::Status> {
+        if let Some(prev_build_id) = self.assigned_build {
+            if prev_build_id != build_id {
+                return Err(tonic::Status::internal(format!("can't assign build {build_id} to worker because the worker is already assigned build {prev_build_id}")));
+            }
+        }
+        Ok(())
+    }
+
+    fn try_assign_build(&mut self, build: &scheduler::Build) -> Result<bool, tonic::Status> {
+        self.check_assignment(build.id)?;
         if let Some(tx) = self.tx.take() {
             if tx.send(build.clone()).is_err() {
-                return false;
+                return Ok(false);
             }
             self.assigned_build = Some(build.id);
-            return true;
+            return Ok(true);
         }
-        false
+        Ok(false)
+    }
+
+    fn assign_build(&mut self, build: &scheduler::Build) -> Result<(), tonic::Status> {
+        self.check_assignment(build.id)?;
+        self.assigned_build = Some(build.id);
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(build.clone());
+        }
+        Ok(())
     }
 }
 
 impl Build {
-    fn accept_assignment(&mut self, worker_id: u64) -> Result<(), tonic::Status> {
+    fn assign_worker(&mut self, worker_id: u64) -> Result<(), tonic::Status> {
         if let Some(prev_worker_id) = self.assigned_worker {
             if prev_worker_id != worker_id {
                 return Err(tonic::Status::internal(format!("build was already previously assigned to worker {prev_worker_id} but is being assigned to {worker_id} again")));
@@ -326,9 +352,7 @@ impl Queue {
             proto: sbuild,
         };
         if let Some(worker_id) = try_assign_build(&build.proto, bs, &mut workersets, &mut workers) {
-            build.assigned_at = Some(tokio::time::Instant::now());
-            build.last_heartbeat_at = Some(tokio::time::Instant::now());
-            build.assigned_worker = Some(worker_id);
+            build.assign_worker(worker_id)?;
         } else {
             bs.queue.push_back(build_id);
         }
@@ -366,7 +390,7 @@ impl Queue {
                     "popped non-existent build id {build_id:?} from internal queue"
                 ))
             })?;
-            b.accept_assignment(worker_id).map_err(|err| {
+            b.assign_worker(worker_id).map_err(|err| {
                 tonic::Status::new(
                     err.code(),
                     format!("error assigning build {build_id} to worker {worker_id}"),
@@ -397,7 +421,7 @@ impl Queue {
                     "popped non-existent build id {build_id:?} from internal queue"
                 ))
             })?;
-            b.accept_assignment(worker_id).map_err(|err| {
+            b.assign_worker(worker_id).map_err(|err| {
                 tonic::Status::new(
                     err.code(),
                     format!("error assigning build {build_id} to worker {worker_id}"),
