@@ -25,6 +25,7 @@ async fn loadgen_task_inner(args: &Args, task_id: i32) -> Result<()> {
     let mut client = BuildsClient::connect(args.scheduler_addr.clone())
         .await
         .with_context(|| format!("unable to connect to scheduler at {}", args.scheduler_addr))?;
+    let mut builds = Vec::new();
     for _ in 0..10 {
         let dur = rand::thread_rng().gen_range(1..10u64);
         let resp = client
@@ -38,9 +39,28 @@ async fn loadgen_task_inner(args: &Args, task_id: i32) -> Result<()> {
             .await
             .with_context(|| format!("task {task_id} failed to create build"))?
             .into_inner();
+        builds.push(resp.build_id);
         println!(
             "Task {task_id} created build {} with duration {dur}s.",
             resp.build_id
+        );
+    }
+    for build_id in builds {
+        let resp = client
+            .wait_build(scheduler::WaitBuildRequest { build_id })
+            .await
+            .with_context(|| format!("Task {task_id} got error waiting for build {build_id}"))?
+            .into_inner();
+        let build_result = match resp.build_result {
+            None => {
+                eprintln!("Task {task_id} got empty build result for build {build_id}");
+                continue;
+            }
+            Some(r) => r,
+        };
+        print!(
+            "Task {task_id}, build {build_id} completed with status={}",
+            build_result.status
         );
     }
     println!("Load generator task {task_id} is exiting.");
