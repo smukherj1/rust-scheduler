@@ -68,7 +68,7 @@ impl Runner {
         let b = b.build.unwrap();
         let (tx, rx) = tokio::sync::mpsc::channel::<()>(1);
         let jh = tokio::spawn(build_heartbeats(self.id(), client.clone(), b.clone(), rx));
-        sleep_seconds(b.sleep_ms / 1000).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(b.sleep_ms)).await;
         if let Err(err) = tx.send(()).await {
             println!("Runner {} unable to signal completion of build {} to the heartbeat sender background task: {err}", self.id(), b.id);
         }

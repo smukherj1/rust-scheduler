@@ -4,7 +4,6 @@ use std::{
     collections::{HashMap, VecDeque},
     io::Write,
     sync::{atomic::Ordering, Mutex, MutexGuard},
-    time,
 };
 
 pub mod scheduler {
@@ -240,6 +239,10 @@ impl WorkerSet {
         }
         self.waiting_worker_ids.push_back(worker_id);
     }
+
+    fn remove_available_worker(&mut self, worker_id: u64) {
+        self.waiting_worker_ids.retain(|id| *id != worker_id);
+    }
 }
 
 impl Worker {
@@ -332,9 +335,13 @@ impl Build {
         Ok(())
     }
 
-    fn result(&self) -> Option<scheduler::BuildResult> {
+    fn completed(&self) -> bool {
+        self.status.is_some()
+    }
+
+    fn result(&self) -> scheduler::BuildResult {
         let status = match self.status.as_ref() {
-            None => return None,
+            None => tonic::Status::unknown("pending on worker"),
             Some(s) => s.clone(),
         };
         let as_time_ms = |t: std::time::SystemTime| {
@@ -348,7 +355,7 @@ impl Build {
             Some(t) => as_time_ms(t),
             None => 0,
         };
-        Some(scheduler::BuildResult {
+        scheduler::BuildResult {
             creation_time_ms: as_time_ms(self.created_at),
             assign_time_ms: from_opt_time(self.assigned_at),
             completion_time_ms: from_opt_time(self.completed_at),
@@ -358,7 +365,7 @@ impl Build {
             } else {
                 String::new()
             },
-        })
+        }
     }
 }
 
@@ -508,6 +515,7 @@ impl Queue {
                     format!("error assigning build {build_id} to worker {worker_id}"),
                 )
             })?;
+            ws.remove_available_worker(worker_id);
             return Ok(BuildResponse::Build(b.proto.clone()));
         }
 
@@ -542,6 +550,9 @@ impl Queue {
         if !done {
             return Ok(());
         }
+        if let Some(tx) = build.tx.take() {
+            let _ = tx.send(build.result());
+        }
         let ws = workersets.get_mut(&worker.wsid).ok_or_else(|| {
             tonic::Status::internal(format!(
                 "worker id {worker_id} contained non-existent worker set id {:?}",
@@ -559,8 +570,8 @@ impl Queue {
                 "can't wait on non-existent build id {build_id}"
             ))
         })?;
-        if let Some(result) = build.result() {
-            return Ok(BuildResultResponse::BuildResult(result));
+        if build.completed() {
+            return Ok(BuildResultResponse::BuildResult(build.result()));
         }
         let (tx, rx) = tokio::sync::oneshot::channel();
         build.tx = Some(tx);

@@ -18,61 +18,92 @@ struct Args {
     /// Number of worker tasks to spawn.
     #[arg(short, long, default_value_t = 1)]
     workers: i32,
+
+    /// Number of concurrent builds to spawn per task.
+    #[arg(short, long, default_value_t = 1)]
+    builds_per_worker: i32,
+}
+
+struct Build {
+    id: u64,
+    sleep_ms: u64,
 }
 
 async fn loadgen_task_inner(args: &Args, task_id: i32) -> Result<()> {
-    println!("Load generator task {task_id} is alive.");
+    // println!("Load generator task {task_id} is alive.");
     let mut client = BuildsClient::connect(args.scheduler_addr.clone())
         .await
         .with_context(|| format!("unable to connect to scheduler at {}", args.scheduler_addr))?;
     let mut builds = Vec::new();
-    for _ in 0..10 {
-        let dur = rand::thread_rng().gen_range(1..10u64);
+    for _ in 0..args.builds_per_worker {
+        let dur = rand::thread_rng().gen_range(10..250u64);
         let resp = client
             .create_build(scheduler::CreateBuildRequest {
                 build: Some(scheduler::Build {
                     id: 0,
                     requirements: vec![],
-                    sleep_ms: dur * 1000,
+                    sleep_ms: dur,
                 }),
             })
             .await
             .with_context(|| format!("task {task_id} failed to create build"))?
             .into_inner();
-        builds.push(resp.build_id);
+        builds.push(Build {
+            id: resp.build_id,
+            sleep_ms: dur,
+        });
+        /*
         println!(
-            "Task {task_id} created build {} with duration {dur}s.",
+            "Task {task_id} created build {} with duration {dur}ms.",
             resp.build_id
         );
+        */
     }
-    for build_id in builds {
+    for b in builds {
         let resp = client
-            .wait_build(scheduler::WaitBuildRequest { build_id })
+            .wait_build(scheduler::WaitBuildRequest { build_id: b.id })
             .await
-            .with_context(|| format!("Task {task_id} got error waiting for build {build_id}"))?
+            .with_context(|| format!("Task {task_id} got error waiting for build {}", b.id))?
             .into_inner();
         let build_result = match resp.build_result {
             None => {
-                eprintln!("Task {task_id} got empty build result for build {build_id}");
+                eprintln!("Task {task_id} got empty build result for build {}", b.id);
                 continue;
             }
             Some(r) => r,
         };
-        print!(
-            "Task {task_id}, build {build_id} completed with status={}",
-            build_result.status
+        let status = tonic::Status::new(
+            tonic::Code::from_i32(build_result.status),
+            build_result.details,
         );
+        let queued_ms = if build_result.assign_time_ms > build_result.creation_time_ms {
+            build_result.assign_time_ms - build_result.creation_time_ms
+        } else {
+            0
+        };
+        let exec_ms = if build_result.completion_time_ms > build_result.assign_time_ms {
+            build_result.completion_time_ms - build_result.assign_time_ms
+        } else {
+            0
+        };
+
+        if status.code() != tonic::Code::Ok || b.id % 100 == 0 || queued_ms > 500 {
+            println!(
+                "Task {task_id}, build {}, sleep_ms {}, completed with status {} {}, queued_ms {queued_ms}, exec_ms {exec_ms}",
+                b.id, b.sleep_ms, status.code(), status.message(),
+            );
+        }
     }
-    println!("Load generator task {task_id} is exiting.");
+    // println!("Load generator task {task_id} is exiting.");
     Ok(())
 }
 
 async fn loadgen_task(args: Arc<Args>, task_id: i32) {
     loop {
         if let Err(err) = loadgen_task_inner(&args, task_id).await {
-            println!("Load generator task {task_id} quit with error: {err:?}",);
+            eprintln!("Load generator task {task_id} quit with error: {err:?}",);
         }
-        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+        // tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
     }
 }
 
@@ -81,6 +112,12 @@ fn validate_args(args: &Args) -> Result<()> {
         anyhow::bail!(
             "invalid value for option workers, got {}, want >= 1",
             args.workers
+        );
+    }
+    if args.builds_per_worker < 1 {
+        anyhow::bail!(
+            "invalid value for option builds_per_worker, got {}, want >= 1",
+            args.builds_per_worker
         );
     }
     if args.scheduler_addr.is_empty() {
