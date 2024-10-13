@@ -4,6 +4,7 @@ use std::{
     collections::{HashMap, VecDeque},
     io::Write,
     sync::{atomic::Ordering, Mutex, MutexGuard},
+    time,
 };
 
 pub mod scheduler {
@@ -271,9 +272,52 @@ impl Worker {
         }
         Ok(())
     }
+
+    fn on_heartbeat(&mut self, build_id: u64, done: bool) -> Result<(), tonic::Status> {
+        if let Some(assigned_build_id) = self.assigned_build {
+            if assigned_build_id != build_id {
+                return Err(tonic::Status::invalid_argument(format!("invalid heartbeat for build {build_id}, done={done} because worker is currently assigned build {assigned_build_id}")));
+            }
+        } else {
+            return Err(tonic::Status::invalid_argument(format!("invalid heartbeat for build {build_id}, done={done} because worker is currently not assigned any build")));
+        }
+        let now = std::time::SystemTime::now();
+        self.last_heartbeat_at = now;
+        if done {
+            self.assigned_build = None;
+        }
+        Ok(())
+    }
 }
 
 impl Build {
+    fn verify_assignment(&self, worker_id: u64) -> Result<(), tonic::Status> {
+        if let Some(assigned_worker_id) = self.assigned_worker {
+            if assigned_worker_id != worker_id {
+                return Err(tonic::Status::invalid_argument(format!("can't modify build as worker {worker_id} because build is actually assigned to worker {assigned_worker_id}")));
+            }
+        } else {
+            return Err(tonic::Status::invalid_argument(format!(
+                "can't modify build as worker {worker_id} because build is currently unassigned"
+            )));
+        }
+        Ok(())
+    }
+    fn on_heartbeat(&mut self, worker_id: u64, done: bool) -> Result<(), tonic::Status> {
+        self.verify_assignment(worker_id)?;
+        if let Some(st) = self.status.as_ref() {
+            return Err(tonic::Status::invalid_argument(format!("unexpected heartbeat from worker {worker_id} for already completed build with status {st}")));
+        }
+        let now = std::time::SystemTime::now();
+        self.last_heartbeat_at = Some(now);
+        if !done {
+            return Ok(());
+        }
+        self.completed_at = Some(now);
+        self.status = Some(tonic::Status::ok(""));
+        Ok(())
+    }
+
     fn assign_worker(&mut self, worker_id: u64) -> Result<(), tonic::Status> {
         if let Some(prev_worker_id) = self.assigned_worker {
             if prev_worker_id != worker_id {
@@ -458,6 +502,12 @@ impl Queue {
                     format!("error assigning build {build_id} to worker {worker_id}"),
                 )
             })?;
+            w.assign_build(&b.proto).map_err(|err| {
+                tonic::Status::new(
+                    err.code(),
+                    format!("error assigning build {build_id} to worker {worker_id}"),
+                )
+            })?;
             return Ok(BuildResponse::Build(b.proto.clone()));
         }
 
@@ -475,9 +525,31 @@ impl Queue {
         build_id: u64,
         done: bool,
     ) -> Result<(), tonic::Status> {
-        Err(tonic::Status::unimplemented(
-            "build_heartbeat is unimplemented",
-        ))
+        let (buildsets, mut workersets, mut builds, mut workers) = self.grab_locks()?;
+        drop(buildsets);
+        let build = builds.get_mut(&build_id).ok_or_else(|| {
+            tonic::Status::invalid_argument(format!("build id {build_id} is invalid in heartbeat request from worker {worker_id}, done={done}"))
+        })?;
+        let worker = workers.get_mut(&worker_id).ok_or_else(|| {
+            tonic::Status::invalid_argument(format!("worker id {build_id} is invalid in heartbeat request for build {build_id}, done={done}"))
+        })?;
+        build.on_heartbeat(worker_id, done).map_err(|err| {
+            tonic::Status::new(err.code(), format!("unable to record heartbeat on build {build_id} from worker {worker_id}, done={done}: {err:?}"))
+        })?;
+        worker.on_heartbeat(build_id, done).map_err(|err| {
+            tonic::Status::new(err.code(), format!("unable to record heartbeat on worker {worker_id} for build {build_id}, done={done}: {err:?}"))
+        })?;
+        if !done {
+            return Ok(());
+        }
+        let ws = workersets.get_mut(&worker.wsid).ok_or_else(|| {
+            tonic::Status::internal(format!(
+                "worker id {worker_id} contained non-existent worker set id {:?}",
+                worker.wsid
+            ))
+        })?;
+        ws.add_available_worker(worker_id);
+        Ok(())
     }
 
     pub fn wait_build(&self, build_id: u64) -> Result<BuildResultResponse, tonic::Status> {
