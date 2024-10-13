@@ -17,19 +17,20 @@ type WorkerSetId = SetID;
 
 struct Build {
     bsid: BuildSetID,
-    created_at: tokio::time::Instant,
-    assigned_at: Option<tokio::time::Instant>,
+    created_at: std::time::SystemTime,
+    assigned_at: Option<std::time::SystemTime>,
     assigned_worker: Option<u64>,
-    last_heartbeat_at: Option<tokio::time::Instant>,
+    last_heartbeat_at: Option<std::time::SystemTime>,
+    completed_at: Option<std::time::SystemTime>,
     status: Option<tonic::Status>,
-    tx: Option<tokio::sync::oneshot::Sender<()>>,
+    tx: Option<tokio::sync::oneshot::Sender<scheduler::BuildResult>>,
     proto: scheduler::Build,
 }
 
 struct Worker {
     wsid: WorkerSetId,
-    registered_at: tokio::time::Instant,
-    last_heartbeat_at: tokio::time::Instant,
+    registered_at: std::time::SystemTime,
+    last_heartbeat_at: std::time::SystemTime,
     tx: Option<tokio::sync::oneshot::Sender<scheduler::Build>>,
     assigned_build: Option<u64>,
 }
@@ -58,6 +59,11 @@ pub struct Queue {
 pub enum BuildResponse {
     Build(scheduler::Build),
     WaitChannel(tokio::sync::oneshot::Receiver<scheduler::Build>),
+}
+
+pub enum BuildResultResponse {
+    BuildResult(scheduler::BuildResult),
+    WaitChannel(tokio::sync::oneshot::Receiver<scheduler::BuildResult>),
 }
 
 fn req_into_constraints(req: &[scheduler::Requirement]) -> Constraints {
@@ -236,10 +242,6 @@ impl WorkerSet {
 }
 
 impl Worker {
-    fn expired(&self) -> bool {
-        self.last_heartbeat_at.elapsed() > tokio::time::Duration::from_secs(5 * 60)
-    }
-
     fn check_assignment(&self, build_id: u64) -> Result<(), tonic::Status> {
         if let Some(prev_build_id) = self.assigned_build {
             if prev_build_id != build_id {
@@ -278,17 +280,41 @@ impl Build {
                 return Err(tonic::Status::internal(format!("build was already previously assigned to worker {prev_worker_id} but is being assigned to {worker_id} again")));
             }
         } else {
-            let now = tokio::time::Instant::now();
+            let now = std::time::SystemTime::now();
             self.assigned_at = Some(now);
             self.assigned_worker = Some(worker_id);
             self.last_heartbeat_at = Some(now);
         }
-        if let Some(tx) = self.tx.take() {
-            // The client may have stopped waiting so it's ok for
-            // this send to fail.
-            let _ = tx.send(());
-        }
         Ok(())
+    }
+
+    fn result(&self) -> Option<scheduler::BuildResult> {
+        let status = match self.status.as_ref() {
+            None => return None,
+            Some(s) => s.clone(),
+        };
+        let as_time_ms = |t: std::time::SystemTime| {
+            let dur: u64 = match t.duration_since(std::time::UNIX_EPOCH).ok() {
+                None => 0,
+                Some(d) => d.as_millis().try_into().unwrap_or(0),
+            };
+            dur
+        };
+        let from_opt_time = |tops: Option<std::time::SystemTime>| match tops {
+            Some(t) => as_time_ms(t),
+            None => 0,
+        };
+        Some(scheduler::BuildResult {
+            creation_time_ms: as_time_ms(self.created_at),
+            assign_time_ms: from_opt_time(self.assigned_at),
+            completion_time_ms: from_opt_time(self.completed_at),
+            status: status.code().into(),
+            details: if status.code() != tonic::Code::Ok {
+                format!("{:?}", status)
+            } else {
+                String::new()
+            },
+        })
     }
 }
 
@@ -311,6 +337,14 @@ impl Queue {
         }
     }
 
+    fn grab_builds_lock(&self) -> Result<MutexGuard<HashMap<u64, Build>>, tonic::Status> {
+        self.builds.lock().map_err(|err| {
+            tonic::Status::internal(format!(
+                "detected panic while trying to grab scheduler builds lock: {err:?}"
+            ))
+        })
+    }
+
     fn grab_locks(&self) -> Result<QueueLocks<'_>, tonic::Status> {
         let buildsets = self.buildsets.lock().map_err(|err| {
             tonic::Status::internal(format!(
@@ -322,11 +356,7 @@ impl Queue {
                 "detected panic while trying to grab scheduler worker set lock: {err:?}"
             ))
         })?;
-        let builds = self.builds.lock().map_err(|err| {
-            tonic::Status::internal(format!(
-                "detected panic while trying to grab scheduler builds lock: {err:?}"
-            ))
-        })?;
+        let builds = self.grab_builds_lock()?;
         let workers = self.workers.lock().map_err(|err| {
             tonic::Status::internal(format!(
                 "detected panic while trying to grab scheduler workers lock: {err:?}"
@@ -345,8 +375,9 @@ impl Queue {
             bsid,
             assigned_at: None,
             assigned_worker: None,
-            created_at: tokio::time::Instant::now(),
+            created_at: std::time::SystemTime::now(),
             last_heartbeat_at: None,
+            completed_at: None,
             status: None,
             tx: None,
             proto: sbuild,
@@ -369,8 +400,8 @@ impl Queue {
             worker_id,
             Worker {
                 wsid,
-                registered_at: tokio::time::Instant::now(),
-                last_heartbeat_at: tokio::time::Instant::now(),
+                registered_at: std::time::SystemTime::now(),
+                last_heartbeat_at: std::time::SystemTime::now(),
                 tx: None,
                 assigned_build: None,
             },
@@ -449,8 +480,19 @@ impl Queue {
         ))
     }
 
-    pub fn wait_build(&self, build_id: u64) -> Result<BuildResponse, tonic::Status> {
-        Err(tonic::Status::unimplemented("wait_build is unimplemented"))
+    pub fn wait_build(&self, build_id: u64) -> Result<BuildResultResponse, tonic::Status> {
+        let mut builds = self.grab_builds_lock()?;
+        let build = builds.get_mut(&build_id).ok_or_else(|| {
+            tonic::Status::invalid_argument(format!(
+                "can't wait on non-existent build id {build_id}"
+            ))
+        })?;
+        if let Some(result) = build.result() {
+            return Ok(BuildResultResponse::BuildResult(result));
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        build.tx = Some(tx);
+        Ok(BuildResultResponse::WaitChannel(rx))
     }
 }
 

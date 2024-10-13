@@ -8,9 +8,9 @@ use scheduler::builds_server::{Builds, BuildsServer};
 use scheduler::workers_server::{Workers, WorkersServer};
 use scheduler::{
     AcceptBuildRequest, AcceptBuildResponse, BuildHeartBeatRequest, BuildHeartBeatResponse,
-    RegisterWorkerRequest, RegisterWorkerResponse, WaitBuildRequest, WaitBuildResponse,
+    CreateBuildRequest, CreateBuildResponse, RegisterWorkerRequest, RegisterWorkerResponse,
+    WaitBuildRequest, WaitBuildResponse,
 };
-use scheduler::{CreateBuildRequest, CreateBuildResponse};
 use tonic::{transport::Server, Request, Response, Status};
 
 #[derive(Parser, Debug)]
@@ -58,15 +58,17 @@ impl Builds for BuildsService<'static> {
             .q
             .wait_build(req.build_id)
             .map_err(|err| Status::new(err.code(), format!("error waiting for build: {err:?}")))?;
-        let build = match resp {
-            queue::BuildResponse::Build(b) => b,
-            queue::BuildResponse::WaitChannel(rx) => rx.await.map_err(|err| {
+        let build_result = match resp {
+            queue::BuildResultResponse::BuildResult(br) => br,
+            queue::BuildResultResponse::WaitChannel(rx) => rx.await.map_err(|err| {
                 Status::internal(format!(
                     "error receiving build from scheduler queue: {err:?}"
                 ))
             })?,
         };
-        Ok(Response::new(WaitBuildResponse { build: Some(build) }))
+        Ok(Response::new(WaitBuildResponse {
+            build_result: Some(build_result),
+        }))
     }
 }
 
