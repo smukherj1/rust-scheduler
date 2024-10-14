@@ -1,1 +1,4 @@
 /target
+/monitoring/prometheus/data
+/monitoring/grafana/data
+

@@ -36,7 +36,7 @@ async fn loadgen_task_inner(args: &Args, task_id: i32) -> Result<()> {
         .with_context(|| format!("unable to connect to scheduler at {}", args.scheduler_addr))?;
     let mut builds = Vec::new();
     for _ in 0..args.builds_per_worker {
-        let dur = rand::thread_rng().gen_range(1..20u64);
+        let dur = rand::thread_rng().gen_range(500..5000u64);
         let resp = client
             .create_build(scheduler::CreateBuildRequest {
                 build: Some(scheduler::Build {
@@ -87,7 +87,7 @@ async fn loadgen_task_inner(args: &Args, task_id: i32) -> Result<()> {
             0
         };
 
-        if status.code() != tonic::Code::Ok || b.id % 1000 == 0 || queued_ms > 1000 {
+        if status.code() != tonic::Code::Ok || b.id % 1000 == 0 || queued_ms > 10000 {
             println!(
                 "Task {task_id}, build {}, sleep_ms {}, completed with status {} {}, queued_ms {queued_ms}, exec_ms {exec_ms}",
                 b.id, b.sleep_ms, status.code(), status.message(),
