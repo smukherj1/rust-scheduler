@@ -47,18 +47,18 @@ struct Args {
     metrics_address: String,
 }
 
-pub struct BuildsService<'a> {
-    q: &'a queue::Queue,
+pub struct BuildsService {
+    q: Arc<queue::Queue>,
 }
 
-impl<'a> BuildsService<'a> {
-    fn new(q: &'a queue::Queue) -> Self {
+impl BuildsService {
+    fn new(q: Arc<queue::Queue>) -> Self {
         BuildsService { q }
     }
 }
 
 #[tonic::async_trait]
-impl Builds for BuildsService<'static> {
+impl Builds for BuildsService {
     async fn create_build(
         &self,
         request: Request<CreateBuildRequest>,
@@ -113,18 +113,18 @@ impl Builds for BuildsService<'static> {
     }
 }
 
-pub struct WorkersService<'a> {
-    q: &'a queue::Queue,
+pub struct WorkersService {
+    q: Arc<queue::Queue>,
 }
 
-impl<'a> WorkersService<'a> {
-    fn new(q: &'a queue::Queue) -> Self {
+impl<'a> WorkersService {
+    fn new(q: Arc<queue::Queue>) -> Self {
         WorkersService { q }
     }
 }
 
 #[tonic::async_trait]
-impl Workers for WorkersService<'static> {
+impl Workers for WorkersService {
     async fn register_worker(
         &self,
         request: Request<RegisterWorkerRequest>,
@@ -222,9 +222,9 @@ async fn launch_scheduler_server(args: Arc<Args>) -> Result<()> {
             args.address
         )
     })?;
-    static Q: Lazy<queue::Queue> = Lazy::new(queue::Queue::new);
-    let bs = BuildsService::new(&Q);
-    let ws = WorkersService::new(&Q);
+    let q = Arc::new(queue::Queue::new());
+    let bs = BuildsService::new(Arc::clone(&q));
+    let ws = WorkersService::new(q);
     println!("Launching scheduler GRPC server on {:?}", addr);
     Server::builder()
         .add_service(BuildsServer::new(bs))
