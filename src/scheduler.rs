@@ -1,7 +1,5 @@
 mod queue;
 
-use std::sync::Arc;
-
 use anyhow::{Context, Result};
 use axum::Router;
 use clap::Parser;
@@ -15,6 +13,7 @@ use scheduler::{
     CreateBuildRequest, CreateBuildResponse, RegisterWorkerRequest, RegisterWorkerResponse,
     WaitBuildRequest, WaitBuildResponse,
 };
+use std::sync::Arc;
 use tonic::{transport::Server, Request, Response, Status};
 
 static BUILDS_STARTED_COUNT: Lazy<IntCounterVec> = Lazy::new(|| {
@@ -34,6 +33,65 @@ static BUILDS_COMPLETED_COUNT: Lazy<IntCounterVec> = Lazy::new(|| {
     )
     .unwrap()
 });
+
+static RPC_COUNT: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "scheduler_rpc_count",
+        "Results of RPC calls to the scheduler by method and returned status",
+        &["service", "method", "result"]
+    )
+    .unwrap()
+});
+
+fn code_str(c: tonic::Code) -> &'static str {
+    match c {
+        tonic::Code::Ok => "ok",
+        tonic::Code::Internal => "internal",
+        tonic::Code::InvalidArgument => "invalid_argument",
+        tonic::Code::Aborted => "aborted",
+        tonic::Code::AlreadyExists => "already_exists",
+        tonic::Code::Cancelled => "cancelled",
+        tonic::Code::DataLoss => "data_loss",
+        tonic::Code::DeadlineExceeded => "deadline_exceeded",
+        tonic::Code::FailedPrecondition => "failed_precondition",
+        tonic::Code::NotFound => "not_found",
+        tonic::Code::OutOfRange => "out_of_range",
+        tonic::Code::PermissionDenied => "permission_denied",
+        tonic::Code::ResourceExhausted => "resource_exhausted",
+        tonic::Code::Unauthenticated => "unauthenticated",
+        tonic::Code::Unavailable => "unavailable",
+        tonic::Code::Unimplemented => "unimplemented",
+        tonic::Code::Unknown => "unknown",
+    }
+}
+
+struct RpcReporter<'a> {
+    service: &'a str,
+    method: &'a str,
+    status: tonic::Status,
+}
+
+impl<'a> RpcReporter<'a> {
+    fn new(service: &'a str, method: &'a str) -> Self {
+        RpcReporter {
+            service,
+            method,
+            status: tonic::Status::ok(""),
+        }
+    }
+
+    fn update_status(&mut self, st: &tonic::Status) {
+        self.status = st.clone();
+    }
+}
+
+impl<'a> Drop for RpcReporter<'a> {
+    fn drop(&mut self) {
+        RPC_COUNT
+            .with_label_values(&[self.service, self.method, code_str(self.status.code())])
+            .inc();
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -63,22 +121,18 @@ impl Builds for BuildsService {
         &self,
         request: Request<CreateBuildRequest>,
     ) -> Result<Response<CreateBuildResponse>, Status> {
-        let report_metric = |c: tonic::Code| {
-            BUILDS_STARTED_COUNT
-                .with_label_values(&[format!("{c}").as_str()])
-                .inc();
-        };
+        let mut r = RpcReporter::new("builds", "create_build");
         let b = request
             .into_inner()
             .build
             .ok_or(tonic::Status::invalid_argument(
                 "field build can't be missing in create_build",
             ))
-            .inspect_err(|st| report_metric(st.code()))?;
+            .inspect_err(|st| r.update_status(st))?;
         let build_id = self
             .q
             .create_build(b)
-            .inspect_err(|st| report_metric(st.code()))?;
+            .inspect_err(|st| r.update_status(st))?;
         let resp = CreateBuildResponse { build_id };
 
         BUILDS_STARTED_COUNT.with_label_values(&["ok"]).inc();
@@ -89,18 +143,23 @@ impl Builds for BuildsService {
         &self,
         request: Request<WaitBuildRequest>,
     ) -> Result<Response<WaitBuildResponse>, Status> {
+        let mut r = RpcReporter::new("builds", "wait_build");
         let req = request.into_inner();
         let resp = self
             .q
             .wait_build(req.build_id)
-            .map_err(|err| Status::new(err.code(), format!("error waiting for build: {err:?}")))?;
+            .map_err(|err| Status::new(err.code(), format!("error waiting for build: {err:?}")))
+            .inspect_err(|st| r.update_status(st))?;
         let build_result = match resp {
             queue::BuildResultResponse::BuildResult(br) => br,
-            queue::BuildResultResponse::WaitChannel(rx) => rx.await.map_err(|err| {
-                Status::internal(format!(
-                    "error receiving build from scheduler queue: {err:?}"
-                ))
-            })?,
+            queue::BuildResultResponse::WaitChannel(rx) => rx
+                .await
+                .map_err(|err| {
+                    Status::internal(format!(
+                        "error receiving build from scheduler queue: {err:?}"
+                    ))
+                })
+                .inspect_err(|st| r.update_status(st))?,
         };
         BUILDS_COMPLETED_COUNT
             .with_label_values(
@@ -129,10 +188,12 @@ impl Workers for WorkersService {
         &self,
         request: Request<RegisterWorkerRequest>,
     ) -> Result<Response<RegisterWorkerResponse>, Status> {
+        let mut r = RpcReporter::new("workers", "register_worker");
         let req = request.into_inner();
         let worker = req
             .worker
-            .ok_or_else(|| Status::invalid_argument("missing field: worker"))?;
+            .ok_or_else(|| Status::invalid_argument("missing field: worker"))
+            .inspect_err(|st| r.update_status(st))?;
         let worker_id = self.q.register_worker(&worker.resources).map_err(|err| {
             Status::new(err.code(), format!("unable to register worker: {err:?}"))
         })?;
@@ -146,20 +207,28 @@ impl Workers for WorkersService {
         &self,
         request: Request<AcceptBuildRequest>,
     ) -> Result<Response<AcceptBuildResponse>, Status> {
+        let mut r = RpcReporter::new("workers", "accept_build");
         let req = request.into_inner();
-        let resp = self.q.accept_build(req.worker_id).map_err(|err| {
-            Status::new(
-                err.code(),
-                format!("error accepting build for worker: {err:?}"),
-            )
-        })?;
+        let resp = self
+            .q
+            .accept_build(req.worker_id)
+            .map_err(|err| {
+                Status::new(
+                    err.code(),
+                    format!("error accepting build for worker: {err:?}"),
+                )
+            })
+            .inspect_err(|st| r.update_status(st))?;
         let build = match resp {
             queue::BuildResponse::Build(b) => b,
-            queue::BuildResponse::WaitChannel(rx) => rx.await.map_err(|err| {
-                Status::internal(format!(
-                    "error receiving build for worker from scheduler queue: {err:?}"
-                ))
-            })?,
+            queue::BuildResponse::WaitChannel(rx) => rx
+                .await
+                .map_err(|err| {
+                    Status::internal(format!(
+                        "error receiving build for worker from scheduler queue: {err:?}"
+                    ))
+                })
+                .inspect_err(|st| r.update_status(st))?,
         };
         Ok(Response::new(AcceptBuildResponse { build: Some(build) }))
     }
@@ -168,6 +237,7 @@ impl Workers for WorkersService {
         &self,
         request: Request<BuildHeartBeatRequest>,
     ) -> Result<Response<BuildHeartBeatResponse>, Status> {
+        let mut r = RpcReporter::new("workers", "build_heart_beat");
         let req = request.into_inner();
         self.q
             .build_heartbeat(req.worker_id, req.build_id, req.done)
@@ -176,7 +246,8 @@ impl Workers for WorkersService {
                     err.code(),
                     format!("error accepting heartbeat for build: {err:?}"),
                 )
-            })?;
+            })
+            .inspect_err(|st| r.update_status(st))?;
         Ok(Response::new(BuildHeartBeatResponse {}))
     }
 }
