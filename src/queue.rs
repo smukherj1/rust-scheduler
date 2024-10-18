@@ -47,9 +47,25 @@ struct WorkerSet {
     build_set_ids: Vec<BuildSetID>,
 }
 
+pub struct QueueStats {
+    pub total_builds: u64,
+    pub queued_builds: u64,
+    pub running_builds: u64,
+    pub total_workers: u64,
+    pub idle_workers: u64,
+    pub busy_workers: u64,
+}
+
 pub struct Queue {
     next_build_id: std::sync::atomic::AtomicU64,
     next_worker_id: std::sync::atomic::AtomicU64,
+    queued_builds: std::sync::atomic::AtomicU64,
+    running_builds: std::sync::atomic::AtomicU64,
+    idle_workers: std::sync::atomic::AtomicU64,
+    busy_workers: std::sync::atomic::AtomicU64,
+    total_builds: std::sync::atomic::AtomicU64,
+    total_workers: std::sync::atomic::AtomicU64,
+
     builds: Mutex<HashMap<u64, Build>>,
     workers: Mutex<HashMap<u64, Worker>>,
     buildsets: Mutex<HashMap<BuildSetID, BuildSet>>,
@@ -381,6 +397,12 @@ impl Queue {
         Queue {
             next_build_id: 1.into(),
             next_worker_id: 1.into(),
+            queued_builds: 0.into(),
+            running_builds: 0.into(),
+            idle_workers: 0.into(),
+            busy_workers: 0.into(),
+            total_builds: 0.into(),
+            total_workers: 0.into(),
             builds: Mutex::new(HashMap::new()),
             workers: Mutex::new(HashMap::new()),
             buildsets: Mutex::new(HashMap::new()),
@@ -388,12 +410,26 @@ impl Queue {
         }
     }
 
+    pub fn stats(&self) -> QueueStats {
+        QueueStats {
+            total_builds: self.total_builds.load(Ordering::Relaxed),
+            queued_builds: self.queued_builds.load(Ordering::Relaxed),
+            running_builds: self.running_builds.load(Ordering::Relaxed),
+            total_workers: self.total_workers.load(Ordering::Relaxed),
+            idle_workers: self.idle_workers.load(Ordering::Relaxed),
+            busy_workers: self.busy_workers.load(Ordering::Relaxed),
+        }
+    }
+
     fn grab_builds_lock(&self) -> Result<MutexGuard<HashMap<u64, Build>>, tonic::Status> {
-        self.builds.lock().map_err(|err| {
+        let builds = self.builds.lock().map_err(|err| {
             tonic::Status::internal(format!(
                 "detected panic while trying to grab scheduler builds lock: {err:?}"
             ))
-        })
+        })?;
+        self.total_builds
+            .store(builds.len() as u64, Ordering::Relaxed);
+        Ok(builds)
     }
 
     fn grab_locks(&self) -> Result<QueueLocks<'_>, tonic::Status> {
@@ -413,7 +449,30 @@ impl Queue {
                 "detected panic while trying to grab scheduler workers lock: {err:?}"
             ))
         })?;
+        self.total_workers
+            .store(workers.len() as u64, Ordering::Relaxed);
         Ok((buildsets, workersets, builds, workers))
+    }
+
+    fn update_build_assignment_counters(&self, queued: bool) {
+        if queued && self.queued_builds.fetch_sub(1, Ordering::Relaxed) == 0 {
+            self.queued_builds.store(0, Ordering::Relaxed);
+        }
+        self.running_builds.fetch_add(1, Ordering::Relaxed);
+        if self.idle_workers.fetch_sub(1, Ordering::Relaxed) == 0 {
+            self.idle_workers.store(0, Ordering::Relaxed);
+        }
+        self.busy_workers.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn update_build_completion_counters(&self) {
+        if self.busy_workers.fetch_sub(1, Ordering::Relaxed) == 0 {
+            self.busy_workers.store(0, Ordering::Relaxed);
+        }
+        self.idle_workers.fetch_add(1, Ordering::Relaxed);
+        if self.running_builds.fetch_sub(1, Ordering::Relaxed) == 0 {
+            self.running_builds.store(0, Ordering::Relaxed);
+        }
     }
 
     pub fn create_build(&self, mut sbuild: scheduler::Build) -> Result<u64, tonic::Status> {
@@ -435,7 +494,9 @@ impl Queue {
         };
         if let Some(worker_id) = try_assign_build(&build.proto, bs, &mut workersets, &mut workers) {
             build.assign_worker(worker_id)?;
+            self.update_build_assignment_counters(false);
         } else {
+            self.queued_builds.fetch_add(1, Ordering::Relaxed);
             bs.queue.push_back(build_id);
         }
         builds.insert(build_id, build);
@@ -457,6 +518,7 @@ impl Queue {
                 assigned_build: None,
             },
         );
+        self.idle_workers.fetch_add(1, Ordering::Relaxed);
         Ok(worker_id)
     }
 
@@ -516,6 +578,7 @@ impl Queue {
                 )
             })?;
             ws.remove_available_worker(worker_id);
+            self.update_build_assignment_counters(true);
             return Ok(BuildResponse::Build(b.proto.clone()));
         }
 
@@ -560,6 +623,7 @@ impl Queue {
             ))
         })?;
         ws.add_available_worker(worker_id);
+        self.update_build_completion_counters();
         Ok(())
     }
 

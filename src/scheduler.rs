@@ -4,7 +4,10 @@ use anyhow::{Context, Result};
 use axum::Router;
 use clap::Parser;
 use once_cell::sync::Lazy;
-use prometheus::{self, register_int_counter_vec, Encoder, IntCounterVec, TextEncoder};
+use prometheus::{
+    self, register_int_counter_vec, register_int_gauge_vec, Encoder, IntCounterVec, IntGaugeVec,
+    TextEncoder,
+};
 use queue::scheduler;
 use scheduler::builds_server::{Builds, BuildsServer};
 use scheduler::workers_server::{Workers, WorkersServer};
@@ -16,29 +19,29 @@ use scheduler::{
 use std::sync::Arc;
 use tonic::{transport::Server, Request, Response, Status};
 
-static BUILDS_STARTED_COUNT: Lazy<IntCounterVec> = Lazy::new(|| {
-    register_int_counter_vec!(
-        "builds_started_count",
-        "Number of builds started",
-        &["status"]
-    )
-    .unwrap()
-});
-
-static BUILDS_COMPLETED_COUNT: Lazy<IntCounterVec> = Lazy::new(|| {
-    register_int_counter_vec!(
-        "builds_completed_count",
-        "Number of completed builds",
-        &["status"]
-    )
-    .unwrap()
-});
-
 static RPC_COUNT: Lazy<IntCounterVec> = Lazy::new(|| {
     register_int_counter_vec!(
         "scheduler_rpc_count",
         "Results of RPC calls to the scheduler by method and returned status",
         &["service", "method", "result"]
+    )
+    .unwrap()
+});
+
+static ACTIVE_BUILDS: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge_vec!(
+        "scheduler_active_builds",
+        "Number of currently active builds broken down by total (in memory), queued and running",
+        &["category"]
+    )
+    .unwrap()
+});
+
+static ACTIVE_WORKERS: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge_vec!(
+        "scheduler_active_workers",
+        "Number of currently active workers broken down by total (in memory), idle and busy",
+        &["category"]
     )
     .unwrap()
 });
@@ -135,7 +138,6 @@ impl Builds for BuildsService {
             .inspect_err(|st| r.update_status(st))?;
         let resp = CreateBuildResponse { build_id };
 
-        BUILDS_STARTED_COUNT.with_label_values(&["ok"]).inc();
         Ok(Response::new(resp)) // Send back our formatted greeting
     }
 
@@ -161,11 +163,6 @@ impl Builds for BuildsService {
                 })
                 .inspect_err(|st| r.update_status(st))?,
         };
-        BUILDS_COMPLETED_COUNT
-            .with_label_values(
-                &[format!("{}", tonic::Code::from_i32(build_result.status)).as_str()],
-            )
-            .inc();
         Ok(Response::new(WaitBuildResponse {
             build_result: Some(build_result),
         }))
@@ -252,6 +249,31 @@ impl Workers for WorkersService {
     }
 }
 
+async fn periodically_report_queue_metrics(q: Arc<queue::Queue>) -> Result<()> {
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        let m = q.stats();
+        ACTIVE_BUILDS
+            .with_label_values(&["total"])
+            .set(m.total_builds as i64);
+        ACTIVE_BUILDS
+            .with_label_values(&["queued"])
+            .set(m.queued_builds as i64);
+        ACTIVE_BUILDS
+            .with_label_values(&["running"])
+            .set(m.running_builds as i64);
+        ACTIVE_WORKERS
+            .with_label_values(&["total"])
+            .set(m.total_workers as i64);
+        ACTIVE_WORKERS
+            .with_label_values(&["idle"])
+            .set(m.idle_workers as i64);
+        ACTIVE_WORKERS
+            .with_label_values(&["busy"])
+            .set(m.busy_workers as i64);
+    }
+}
+
 async fn metrics() -> Result<String, axum::http::StatusCode> {
     let encoder = TextEncoder::new();
     let mut buffer = vec![];
@@ -286,14 +308,13 @@ async fn launch_metrics_server(args: Arc<Args>) -> Result<()> {
     Ok(())
 }
 
-async fn launch_scheduler_server(args: Arc<Args>) -> Result<()> {
+async fn launch_scheduler_server(q: Arc<queue::Queue>, args: Arc<Args>) -> Result<()> {
     let addr = args.address.parse().with_context(|| {
         format!(
             "failed to parse {} as a socker address for scheduler GRPC server",
             args.address
         )
     })?;
-    let q = Arc::new(queue::Queue::new());
     let bs = BuildsService::new(Arc::clone(&q));
     let ws = WorkersService::new(q);
     println!("Launching scheduler GRPC server on {:?}", addr);
@@ -323,9 +344,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut js = tokio::task::JoinSet::new();
 
+    let q = Arc::new(queue::Queue::new());
     let margs = Arc::clone(&args);
     js.spawn(launch_metrics_server(margs));
-    js.spawn(launch_scheduler_server(args));
+    js.spawn(launch_scheduler_server(Arc::clone(&q), args));
+    js.spawn(periodically_report_queue_metrics(q));
 
     while let Some(res) = js.join_next().await {
         let res = match res {
