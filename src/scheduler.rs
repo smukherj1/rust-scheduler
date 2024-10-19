@@ -17,7 +17,6 @@ use scheduler::{
     WaitBuildRequest, WaitBuildResponse,
 };
 use std::sync::Arc;
-use tonic::Code;
 use tonic::{transport::Server, Request, Response, Status};
 
 static RPC_COUNT: Lazy<IntCounterVec> = Lazy::new(|| {

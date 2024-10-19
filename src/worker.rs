@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
+use rand::distributions::Uniform;
+use rand::Rng;
 use scheduler::workers_client::WorkersClient;
 use std::sync::Arc;
 use tonic::transport::Channel;
@@ -18,15 +20,32 @@ struct Args {
     /// Number of worker tasks to spawn.
     #[arg(short, long, default_value_t = 1)]
     workers: i32,
+
+    /// Probability of a build failing [0-100].
+    #[arg(long, default_value_t = 0)]
+    prob_build_failure: i32,
+
+    /// Probability of a worker disappearing between
+    /// build heartbeats [0-100].
+    #[arg(long, default_value_t = 0)]
+    prob_build_heartbeat_failure: i32,
+
+    /// Probability of a worker disappearing on an
+    /// idle iteration between accept_build calls
+    /// [0-100].
+    #[arg(long, default_value_t = 0)]
+    prob_idle_failure: i32,
 }
 
 #[derive(Debug)]
 struct Runner {
     proto: scheduler::Worker,
+    args: Arc<Args>,
+    prob_dist: Uniform<i32>,
 }
 
 impl Runner {
-    async fn new(client: &mut WorkersClient<Channel>) -> Result<Self> {
+    async fn new(client: &mut WorkersClient<Channel>, args: Arc<Args>) -> Result<Self> {
         let mut w = scheduler::Worker {
             id: 0,
             resources: vec![
@@ -49,7 +68,12 @@ impl Runner {
             .into_inner();
         println!("Registered worker {}: {:?}", reg.worker_id, w);
         w.id = reg.worker_id;
-        Ok(Runner { proto: w })
+        let prob_dist = Uniform::from(0..100);
+        Ok(Runner {
+            proto: w,
+            args,
+            prob_dist,
+        })
     }
 
     fn id(&self) -> u64 {
@@ -66,8 +90,28 @@ impl Runner {
             return;
         }
         let b = b.build.unwrap();
+        let die_roll = rand::thread_rng().sample(self.prob_dist);
+        if die_roll < self.args.prob_build_failure {
+            if let Err(err) = send_heartbeat(
+                self.id(),
+                client,
+                b.id,
+                Some(tonic::Status::aborted("synthetic failure")),
+            )
+            .await
+            {
+                eprintln!("Error sending heartbeat for synthetic build failure: {err:?}");
+            }
+            return;
+        }
         let (tx, rx) = tokio::sync::mpsc::channel::<()>(1);
-        let jh = tokio::spawn(build_heartbeats(self.id(), client.clone(), b.clone(), rx));
+        let jh = tokio::spawn(build_heartbeats(
+            self.id(),
+            client.clone(),
+            Arc::clone(&self.args),
+            b.clone(),
+            rx,
+        ));
         tokio::time::sleep(tokio::time::Duration::from_millis(b.sleep_ms)).await;
         if let Err(err) = tx.send(()).await {
             println!("Runner {} unable to signal completion of build {} to the heartbeat sender background task: {err}", self.id(), b.id);
@@ -90,6 +134,11 @@ impl Runner {
         println!("Starting runner {}.", self.id());
         let mut idle_iterations: u64 = 0;
         loop {
+            // self.args.prob_idle_failure
+            let die_roll = rand::thread_rng().sample(self.prob_dist);
+            if die_roll < self.args.prob_idle_failure {
+                break;
+            }
             if idle_iterations > 10 && idle_iterations % 10 == 0 {
                 println!(
                     "Runner {} idle for {} iterations.",
@@ -144,6 +193,7 @@ impl Runner {
                 sleep_seconds(10).await;
             }
         }
+        Ok(())
     }
 }
 
@@ -151,13 +201,19 @@ async fn send_heartbeat(
     runner_id: u64,
     client: &mut WorkersClient<Channel>,
     build_id: u64,
-    done: bool,
+    result: Option<tonic::Status>,
 ) -> Result<()> {
+    let (done, status, details) = match result {
+        None => (false, 0, String::new()),
+        Some(st) => (true, st.code().into(), st.message().to_owned()),
+    };
     if let Err(err) = client
         .build_heart_beat(scheduler::BuildHeartBeatRequest {
             build_id,
             worker_id: runner_id,
             done,
+            status,
+            details,
         })
         .await
     {
@@ -176,15 +232,21 @@ async fn send_heartbeat(
 async fn build_heartbeats(
     runner_id: u64,
     mut client: WorkersClient<Channel>,
+    args: Arc<Args>,
     b: scheduler::Build,
     mut rx: tokio::sync::mpsc::Receiver<()>,
 ) {
+    let dist = Uniform::from(0..100);
     loop {
+        let die_roll = rand::thread_rng().sample(dist);
+        if die_roll < args.prob_build_heartbeat_failure {
+            return;
+        }
         if tokio::time::timeout(tokio::time::Duration::from_secs(5), rx.recv())
             .await
             .is_err()
         {
-            if let Err(err) = send_heartbeat(runner_id, &mut client, b.id, false).await {
+            if let Err(err) = send_heartbeat(runner_id, &mut client, b.id, None).await {
                 println!(
                     "Aborting heartbeats for build {} in runner {runner_id} due to unrecoverable error: {err:?}",
                     b.id
@@ -196,7 +258,9 @@ async fn build_heartbeats(
         // Received build completion signal on rx.
         break;
     }
-    if let Err(err) = send_heartbeat(runner_id, &mut client, b.id, true).await {
+    if let Err(err) =
+        send_heartbeat(runner_id, &mut client, b.id, Some(tonic::Status::ok(""))).await
+    {
         println!(
             "Unrecoverable error sending completion heartbeat for build {} in runner {runner_id}: {err:?}",
             b.id
@@ -208,7 +272,7 @@ async fn sleep_seconds(secs: u64) {
     tokio::time::sleep(tokio::time::Duration::from_secs(secs)).await
 }
 
-async fn launch_new_runner(task_id: i32, args: &Args) -> Result<()> {
+async fn launch_new_runner(task_id: i32, args: Arc<Args>) -> Result<()> {
     let mut client = WorkersClient::connect(args.scheduler_addr.clone())
         .await
         .with_context(|| {
@@ -217,7 +281,7 @@ async fn launch_new_runner(task_id: i32, args: &Args) -> Result<()> {
                 args.scheduler_addr
             )
         })?;
-    let r = Runner::new(&mut client)
+    let r = Runner::new(&mut client, Arc::clone(&args))
         .await
         .with_context(|| "failed to initialize runner")?;
     r.run(&mut client)
@@ -233,13 +297,20 @@ async fn launch_new_runner(task_id: i32, args: &Args) -> Result<()> {
 async fn runner_task(args: Arc<Args>, task_id: i32) {
     loop {
         println!("Runner task {task_id} launching new runner.");
-        if let Err(err) = launch_new_runner(task_id, &args).await {
+        if let Err(err) = launch_new_runner(task_id, Arc::clone(&args)).await {
             println!("Runner in runner task {task_id} exited with error: {err:?}");
         } else {
             println!("Runner in runner task {task_id} exited without error.");
         }
         tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
     }
+}
+
+fn check_prob_arg(val: i32, name: &str) -> Result<()> {
+    if !(0..=100).contains(&val) {
+        anyhow::bail!("invalid value for flag {name}, got {val}, want betweeen >= 0 and <= 100")
+    }
+    Ok(())
 }
 
 fn validate_args(args: &Args) -> Result<()> {
@@ -252,6 +323,12 @@ fn validate_args(args: &Args) -> Result<()> {
     if args.scheduler_addr.is_empty() {
         anyhow::bail!("option scheduler flag can't be empty");
     }
+    check_prob_arg(args.prob_build_failure, "prob-build-failure")?;
+    check_prob_arg(
+        args.prob_build_heartbeat_failure,
+        "prob-build-heartbeat-failure",
+    )?;
+    check_prob_arg(args.prob_idle_failure, "prob-idle-failure")?;
     Ok(())
 }
 

@@ -77,6 +77,8 @@ message BuildHeartBeatRequest {
     uint64 worker_id = 1;
     uint64 build_id = 2;
     bool done = 3;
+    int32 status = 4;
+    string details = 5;
 }
 
 message BuildHeartBeatResponse {}
