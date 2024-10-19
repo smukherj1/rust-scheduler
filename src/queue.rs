@@ -322,7 +322,13 @@ impl Build {
         }
         Ok(())
     }
-    fn on_heartbeat(&mut self, worker_id: u64, done: bool) -> Result<(), tonic::Status> {
+    fn on_heartbeat(
+        &mut self,
+        worker_id: u64,
+        done: bool,
+        status: i32,
+        details: String,
+    ) -> Result<(), tonic::Status> {
         self.verify_assignment(worker_id)?;
         if let Some(st) = self.status.as_ref() {
             return Err(tonic::Status::invalid_argument(format!("unexpected heartbeat from worker {worker_id} for already completed build with status {st}")));
@@ -333,7 +339,7 @@ impl Build {
             return Ok(());
         }
         self.completed_at = Some(now);
-        self.status = Some(tonic::Status::ok(""));
+        self.status = Some(tonic::Status::new(tonic::Code::from_i32(status), details));
         Ok(())
     }
 
@@ -376,11 +382,7 @@ impl Build {
             assign_time_ms: from_opt_time(self.assigned_at),
             completion_time_ms: from_opt_time(self.completed_at),
             status: status.code().into(),
-            details: if status.code() != tonic::Code::Ok {
-                format!("{:?}", status)
-            } else {
-                String::new()
-            },
+            details: status.message().to_string(),
         }
     }
 }
@@ -595,6 +597,8 @@ impl Queue {
         worker_id: u64,
         build_id: u64,
         done: bool,
+        status: i32,
+        details: String,
     ) -> Result<(), tonic::Status> {
         let (buildsets, mut workersets, mut builds, mut workers) = self.grab_locks()?;
         drop(buildsets);
@@ -604,7 +608,7 @@ impl Queue {
         let worker = workers.get_mut(&worker_id).ok_or_else(|| {
             tonic::Status::invalid_argument(format!("worker id {build_id} is invalid in heartbeat request for build {build_id}, done={done}"))
         })?;
-        build.on_heartbeat(worker_id, done).map_err(|err| {
+        build.on_heartbeat(worker_id, done, status, details).map_err(|err| {
             tonic::Status::new(err.code(), format!("unable to record heartbeat on build {build_id} from worker {worker_id}, done={done}: {err:?}"))
         })?;
         worker.on_heartbeat(build_id, done).map_err(|err| {

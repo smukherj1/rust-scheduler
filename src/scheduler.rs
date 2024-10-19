@@ -182,7 +182,7 @@ pub struct WorkersService {
     q: Arc<queue::Queue>,
 }
 
-impl<'a> WorkersService {
+impl WorkersService {
     fn new(q: Arc<queue::Queue>) -> Self {
         WorkersService { q }
     }
@@ -254,7 +254,13 @@ impl Workers for WorkersService {
                 .inc();
         };
         self.q
-            .build_heartbeat(req.worker_id, req.build_id, req.done)
+            .build_heartbeat(
+                req.worker_id,
+                req.build_id,
+                req.done,
+                req.status,
+                req.details,
+            )
             .map_err(|err| {
                 Status::new(
                     err.code(),
@@ -265,7 +271,7 @@ impl Workers for WorkersService {
                 r.update_status(st);
                 report_build_completion(st.code())
             })?;
-        report_build_completion(tonic::Code::Ok);
+        report_build_completion(tonic::Code::from_i32(req.status));
         Ok(Response::new(BuildHeartBeatResponse {}))
     }
 }
