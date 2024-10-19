@@ -17,6 +17,7 @@ use scheduler::{
     WaitBuildRequest, WaitBuildResponse,
 };
 use std::sync::Arc;
+use tonic::Code;
 use tonic::{transport::Server, Request, Response, Status};
 
 static RPC_COUNT: Lazy<IntCounterVec> = Lazy::new(|| {
@@ -24,6 +25,15 @@ static RPC_COUNT: Lazy<IntCounterVec> = Lazy::new(|| {
         "scheduler_rpc_count",
         "Results of RPC calls to the scheduler by method and returned status",
         &["service", "method", "result"]
+    )
+    .unwrap()
+});
+
+static BUILDS_COMPLETED_COUNT: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "scheduler_builds_completed_count",
+        "Count of builds completed by status",
+        &["result"]
     )
     .unwrap()
 });
@@ -236,6 +246,14 @@ impl Workers for WorkersService {
     ) -> Result<Response<BuildHeartBeatResponse>, Status> {
         let mut r = RpcReporter::new("workers", "build_heart_beat");
         let req = request.into_inner();
+        let report_build_completion = |c: tonic::Code| {
+            if !req.done {
+                return;
+            }
+            BUILDS_COMPLETED_COUNT
+                .with_label_values(&[code_str(c)])
+                .inc();
+        };
         self.q
             .build_heartbeat(req.worker_id, req.build_id, req.done)
             .map_err(|err| {
@@ -244,7 +262,11 @@ impl Workers for WorkersService {
                     format!("error accepting heartbeat for build: {err:?}"),
                 )
             })
-            .inspect_err(|st| r.update_status(st))?;
+            .inspect_err(|st| {
+                r.update_status(st);
+                report_build_completion(st.code())
+            })?;
+        report_build_completion(tonic::Code::Ok);
         Ok(Response::new(BuildHeartBeatResponse {}))
     }
 }
