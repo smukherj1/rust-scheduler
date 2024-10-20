@@ -1,13 +1,9 @@
+mod metrics;
 mod queue;
-
 use anyhow::{Context, Result};
 use axum::Router;
 use clap::Parser;
-use once_cell::sync::Lazy;
-use prometheus::{
-    self, register_int_counter_vec, register_int_gauge_vec, Encoder, IntCounterVec, IntGaugeVec,
-    TextEncoder,
-};
+use prometheus::{self, Encoder, TextEncoder};
 use queue::scheduler;
 use scheduler::builds_server::{Builds, BuildsServer};
 use scheduler::workers_server::{Workers, WorkersServer};
@@ -17,43 +13,8 @@ use scheduler::{
     WaitBuildRequest, WaitBuildResponse,
 };
 use std::sync::Arc;
+use std::time::Duration;
 use tonic::{transport::Server, Request, Response, Status};
-
-static RPC_COUNT: Lazy<IntCounterVec> = Lazy::new(|| {
-    register_int_counter_vec!(
-        "scheduler_rpc_count",
-        "Results of RPC calls to the scheduler by method and returned status",
-        &["service", "method", "result"]
-    )
-    .unwrap()
-});
-
-static BUILDS_COMPLETED_COUNT: Lazy<IntCounterVec> = Lazy::new(|| {
-    register_int_counter_vec!(
-        "scheduler_builds_completed_count",
-        "Count of builds completed by status",
-        &["result"]
-    )
-    .unwrap()
-});
-
-static ACTIVE_BUILDS: Lazy<IntGaugeVec> = Lazy::new(|| {
-    register_int_gauge_vec!(
-        "scheduler_active_builds",
-        "Number of currently active builds broken down by total (in memory), queued and running",
-        &["category"]
-    )
-    .unwrap()
-});
-
-static ACTIVE_WORKERS: Lazy<IntGaugeVec> = Lazy::new(|| {
-    register_int_gauge_vec!(
-        "scheduler_active_workers",
-        "Number of currently active workers broken down by total (in memory), idle and busy",
-        &["category"]
-    )
-    .unwrap()
-});
 
 fn code_str(c: tonic::Code) -> &'static str {
     match c {
@@ -81,6 +42,7 @@ struct RpcReporter<'a> {
     service: &'a str,
     method: &'a str,
     status: tonic::Status,
+    begin: std::time::Instant,
 }
 
 impl<'a> RpcReporter<'a> {
@@ -89,6 +51,7 @@ impl<'a> RpcReporter<'a> {
             service,
             method,
             status: tonic::Status::ok(""),
+            begin: std::time::Instant::now(),
         }
     }
 
@@ -99,9 +62,17 @@ impl<'a> RpcReporter<'a> {
 
 impl<'a> Drop for RpcReporter<'a> {
     fn drop(&mut self) {
-        RPC_COUNT
+        metrics::RPC_COUNT
             .with_label_values(&[self.service, self.method, code_str(self.status.code())])
             .inc();
+        metrics::RPC_LATENCY
+            .with_label_values(&[self.service, self.method, code_str(self.status.code())])
+            .observe(
+                std::time::Instant::now()
+                    .checked_duration_since(self.begin)
+                    .unwrap_or(Duration::from_millis(0))
+                    .as_millis() as f64,
+            );
     }
 }
 
@@ -249,7 +220,7 @@ impl Workers for WorkersService {
             if !req.done {
                 return;
             }
-            BUILDS_COMPLETED_COUNT
+            metrics::BUILDS_COMPLETED_COUNT
                 .with_label_values(&[code_str(c)])
                 .inc();
         };
@@ -280,22 +251,22 @@ async fn periodically_report_queue_metrics(q: Arc<queue::Queue>) -> Result<()> {
     loop {
         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
         let m = q.stats();
-        ACTIVE_BUILDS
+        metrics::ACTIVE_BUILDS
             .with_label_values(&["total"])
             .set(m.total_builds as i64);
-        ACTIVE_BUILDS
+        metrics::ACTIVE_BUILDS
             .with_label_values(&["queued"])
             .set(m.queued_builds as i64);
-        ACTIVE_BUILDS
+        metrics::ACTIVE_BUILDS
             .with_label_values(&["running"])
             .set(m.running_builds as i64);
-        ACTIVE_WORKERS
+        metrics::ACTIVE_WORKERS
             .with_label_values(&["total"])
             .set(m.total_workers as i64);
-        ACTIVE_WORKERS
+        metrics::ACTIVE_WORKERS
             .with_label_values(&["idle"])
             .set(m.idle_workers as i64);
-        ACTIVE_WORKERS
+        metrics::ACTIVE_WORKERS
             .with_label_values(&["busy"])
             .set(m.busy_workers as i64);
     }

@@ -4,7 +4,10 @@ use std::{
     collections::{HashMap, VecDeque},
     io::Write,
     sync::{atomic::Ordering, Mutex, MutexGuard},
+    time::Duration,
 };
+
+use crate::metrics;
 
 pub mod scheduler {
     tonic::include_proto!("scheduler");
@@ -80,6 +83,35 @@ pub enum BuildResponse {
 pub enum BuildResultResponse {
     BuildResult(scheduler::BuildResult),
     WaitChannel(tokio::sync::oneshot::Receiver<scheduler::BuildResult>),
+}
+
+struct LockReporter<'a> {
+    name: &'a str,
+    begin: std::time::Instant,
+}
+
+impl<'a> LockReporter<'a> {
+    fn new(name: &'a str) -> Self {
+        metrics::LOCK_WAITERS.with_label_values(&[name]).inc();
+        LockReporter {
+            name,
+            begin: std::time::Instant::now(),
+        }
+    }
+}
+
+impl<'a> Drop for LockReporter<'a> {
+    fn drop(&mut self) {
+        metrics::LOCK_WAITERS.with_label_values(&[self.name]).dec();
+        metrics::LOCK_WAIT_LATENCY
+            .with_label_values(&[self.name])
+            .observe(
+                std::time::Instant::now()
+                    .checked_duration_since(self.begin)
+                    .unwrap_or(Duration::from_millis(0))
+                    .as_millis() as f64,
+            );
+    }
 }
 
 fn req_into_constraints(req: &[scheduler::Requirement]) -> Constraints {
@@ -423,7 +455,7 @@ impl Queue {
         }
     }
 
-    fn grab_builds_lock(&self) -> Result<MutexGuard<HashMap<u64, Build>>, tonic::Status> {
+    fn grab_builds_lock_inner(&self) -> Result<MutexGuard<HashMap<u64, Build>>, tonic::Status> {
         let builds = self.builds.lock().map_err(|err| {
             tonic::Status::internal(format!(
                 "detected panic while trying to grab scheduler builds lock: {err:?}"
@@ -434,7 +466,13 @@ impl Queue {
         Ok(builds)
     }
 
+    fn grab_builds_lock(&self) -> Result<MutexGuard<HashMap<u64, Build>>, tonic::Status> {
+        let _ = LockReporter::new("builds");
+        self.grab_builds_lock_inner()
+    }
+
     fn grab_locks(&self) -> Result<QueueLocks<'_>, tonic::Status> {
+        let _ = LockReporter::new("all");
         let buildsets = self.buildsets.lock().map_err(|err| {
             tonic::Status::internal(format!(
                 "detected panic while trying to grab scheduler build set lock: {err:?}"
@@ -445,7 +483,7 @@ impl Queue {
                 "detected panic while trying to grab scheduler worker set lock: {err:?}"
             ))
         })?;
-        let builds = self.grab_builds_lock()?;
+        let builds = self.grab_builds_lock_inner()?;
         let workers = self.workers.lock().map_err(|err| {
             tonic::Status::internal(format!(
                 "detected panic while trying to grab scheduler workers lock: {err:?}"
