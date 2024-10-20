@@ -16,28 +16,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tonic::{transport::Server, Request, Response, Status};
 
-fn code_str(c: tonic::Code) -> &'static str {
-    match c {
-        tonic::Code::Ok => "ok",
-        tonic::Code::Internal => "internal",
-        tonic::Code::InvalidArgument => "invalid_argument",
-        tonic::Code::Aborted => "aborted",
-        tonic::Code::AlreadyExists => "already_exists",
-        tonic::Code::Cancelled => "cancelled",
-        tonic::Code::DataLoss => "data_loss",
-        tonic::Code::DeadlineExceeded => "deadline_exceeded",
-        tonic::Code::FailedPrecondition => "failed_precondition",
-        tonic::Code::NotFound => "not_found",
-        tonic::Code::OutOfRange => "out_of_range",
-        tonic::Code::PermissionDenied => "permission_denied",
-        tonic::Code::ResourceExhausted => "resource_exhausted",
-        tonic::Code::Unauthenticated => "unauthenticated",
-        tonic::Code::Unavailable => "unavailable",
-        tonic::Code::Unimplemented => "unimplemented",
-        tonic::Code::Unknown => "unknown",
-    }
-}
-
 struct RpcReporter<'a> {
     service: &'a str,
     method: &'a str,
@@ -62,11 +40,12 @@ impl<'a> RpcReporter<'a> {
 
 impl<'a> Drop for RpcReporter<'a> {
     fn drop(&mut self) {
+        let code = metrics::code_str(self.status.code());
         metrics::RPC_COUNT
-            .with_label_values(&[self.service, self.method, code_str(self.status.code())])
+            .with_label_values(&[self.service, self.method, code])
             .inc();
         metrics::RPC_LATENCY
-            .with_label_values(&[self.service, self.method, code_str(self.status.code())])
+            .with_label_values(&[self.service, self.method, code])
             .observe(
                 std::time::Instant::now()
                     .checked_duration_since(self.begin)
@@ -216,14 +195,6 @@ impl Workers for WorkersService {
     ) -> Result<Response<BuildHeartBeatResponse>, Status> {
         let mut r = RpcReporter::new("workers", "build_heart_beat");
         let req = request.into_inner();
-        let report_build_completion = |c: tonic::Code| {
-            if !req.done {
-                return;
-            }
-            metrics::BUILDS_COMPLETED_COUNT
-                .with_label_values(&[code_str(c)])
-                .inc();
-        };
         self.q
             .build_heartbeat(
                 req.worker_id,
@@ -238,11 +209,7 @@ impl Workers for WorkersService {
                     format!("error accepting heartbeat for build: {err:?}"),
                 )
             })
-            .inspect_err(|st| {
-                r.update_status(st);
-                report_build_completion(st.code())
-            })?;
-        report_build_completion(tonic::Code::from_i32(req.status));
+            .inspect_err(|st| r.update_status(st))?;
         Ok(Response::new(BuildHeartBeatResponse {}))
     }
 }

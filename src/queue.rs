@@ -114,6 +114,21 @@ impl<'a> Drop for LockReporter<'a> {
     }
 }
 
+fn report_build_result(r: &scheduler::BuildResult) {
+    let code = metrics::code_str(tonic::Code::from_i32(r.status));
+    metrics::BUILDS_COMPLETED_COUNT
+        .with_label_values(&[code])
+        .inc();
+    let queue_ms = if r.assign_time_ms > r.creation_time_ms {
+        r.assign_time_ms - r.creation_time_ms
+    } else {
+        0
+    };
+    metrics::BUILD_QUEUE_LATENCY
+        .with_label_values(&[code])
+        .observe(queue_ms as f64);
+}
+
 fn req_into_constraints(req: &[scheduler::Requirement]) -> Constraints {
     req.iter()
         .map(|v| (v.key.clone(), v.value.clone()))
@@ -655,8 +670,10 @@ impl Queue {
         if !done {
             return Ok(());
         }
+        let build_result = build.result();
+        report_build_result(&build_result);
         if let Some(tx) = build.tx.take() {
-            let _ = tx.send(build.result());
+            let _ = tx.send(build_result);
         }
         let ws = workersets.get_mut(&worker.wsid).ok_or_else(|| {
             tonic::Status::internal(format!(

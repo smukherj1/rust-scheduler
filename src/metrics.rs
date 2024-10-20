@@ -4,6 +4,7 @@ use prometheus::{
     self, register_histogram_vec, register_int_counter_vec, register_int_gauge_vec, HistogramVec,
     IntCounterVec, IntGaugeVec,
 };
+use tonic;
 
 pub static RPC_COUNT: Lazy<IntCounterVec> = Lazy::new(|| {
     register_int_counter_vec!(
@@ -29,6 +30,16 @@ pub static BUILDS_COMPLETED_COUNT: Lazy<IntCounterVec> = Lazy::new(|| {
         "scheduler_builds_completed_count",
         "Count of builds completed by status",
         &["result"]
+    )
+    .unwrap()
+});
+
+pub static BUILD_QUEUE_LATENCY: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram_vec!(
+        "scheduler_build_queue_latency",
+        "Latency (ms) distribution of time builds were queued by completion status",
+        &["result"],
+        latency_buckets(20).unwrap(),
     )
     .unwrap()
 });
@@ -82,4 +93,26 @@ fn latency_buckets(count: usize) -> Result<Vec<f64>> {
         next *= 2f64;
     }
     Ok(result)
+}
+
+pub fn code_str(c: tonic::Code) -> &'static str {
+    match c {
+        tonic::Code::Ok => "ok",
+        tonic::Code::Internal => "internal",
+        tonic::Code::InvalidArgument => "invalid_argument",
+        tonic::Code::Aborted => "aborted",
+        tonic::Code::AlreadyExists => "already_exists",
+        tonic::Code::Cancelled => "cancelled",
+        tonic::Code::DataLoss => "data_loss",
+        tonic::Code::DeadlineExceeded => "deadline_exceeded",
+        tonic::Code::FailedPrecondition => "failed_precondition",
+        tonic::Code::NotFound => "not_found",
+        tonic::Code::OutOfRange => "out_of_range",
+        tonic::Code::PermissionDenied => "permission_denied",
+        tonic::Code::ResourceExhausted => "resource_exhausted",
+        tonic::Code::Unauthenticated => "unauthenticated",
+        tonic::Code::Unavailable => "unavailable",
+        tonic::Code::Unimplemented => "unimplemented",
+        tonic::Code::Unknown => "unknown",
+    }
 }
