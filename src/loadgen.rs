@@ -22,6 +22,16 @@ struct Args {
     /// Number of concurrent builds to spawn per task.
     #[arg(short, long, default_value_t = 1)]
     builds_per_worker: i32,
+
+    /// Lower bound (ms) for randomnly generated duration of
+    /// builds.
+    #[arg(long, default_value_t = 5)]
+    build_dur_ms_lower_bound: u64,
+
+    /// Upper bound (ms) for randomnly generated duration of
+    /// builds.
+    #[arg(long, default_value_t = 5000)]
+    build_dur_ms_upper_bound: u64,
 }
 
 struct Build {
@@ -36,7 +46,8 @@ async fn loadgen_task_inner(args: &Args, task_id: i32) -> Result<()> {
         .with_context(|| format!("unable to connect to scheduler at {}", args.scheduler_addr))?;
     let mut builds = Vec::new();
     for _ in 0..args.builds_per_worker {
-        let dur = rand::thread_rng().gen_range(500..5000u64);
+        let dur = rand::thread_rng()
+            .gen_range(args.build_dur_ms_lower_bound..args.build_dur_ms_upper_bound);
         let resp = client
             .create_build(scheduler::CreateBuildRequest {
                 build: Some(scheduler::Build {
@@ -60,9 +71,23 @@ async fn loadgen_task_inner(args: &Args, task_id: i32) -> Result<()> {
         */
     }
     for b in builds {
-        let resp = client
-            .wait_build(scheduler::WaitBuildRequest { build_id: b.id })
-            .await
+        let timeout_ms_dur = args.build_dur_ms_upper_bound * (args.builds_per_worker as u64) + 100;
+        let resp = tokio::time::timeout(
+            tokio::time::Duration::from_millis(timeout_ms_dur),
+            client.wait_build(scheduler::WaitBuildRequest { build_id: b.id }),
+        )
+        .await;
+        let resp = match resp {
+            Ok(resp) => resp,
+            Err(timeout_err) => {
+                eprintln!(
+                    "Error: Timed out waiting for build {} with duration {}ms after waiting for {}ms: {timeout_err}",
+                    b.id, b.sleep_ms, timeout_ms_dur
+                );
+                continue;
+            }
+        };
+        let resp = resp
             .with_context(|| format!("Task {task_id} got error waiting for build {}", b.id))?
             .into_inner();
         let build_result = match resp.build_result {
@@ -123,6 +148,24 @@ fn validate_args(args: &Args) -> Result<()> {
     if args.scheduler_addr.is_empty() {
         anyhow::bail!("option scheduler flag can't be empty");
     }
+    if args.build_dur_ms_lower_bound < 5 {
+        anyhow::bail!(
+            "option build-dur-ms-lower-bound value {} is invalid, must be >= 5",
+            args.build_dur_ms_lower_bound
+        );
+    }
+    if args.build_dur_ms_upper_bound > 600_000 {
+        anyhow::bail!(
+            "option build-dur-ms-upper-bound value {} is invalid, must be <= 600_000",
+            args.build_dur_ms_upper_bound
+        );
+    }
+    if args.build_dur_ms_lower_bound >= args.build_dur_ms_upper_bound {
+        anyhow::bail!("option build-dur-ms-lower-bound with value {} must be lower than value {} of option build-dur-ms-upper-bound",
+        args.build_dur_ms_lower_bound, args.build_dur_ms_upper_bound
+    );
+    }
+
     Ok(())
 }
 
