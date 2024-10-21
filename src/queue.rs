@@ -32,7 +32,6 @@ struct Build {
 
 struct Worker {
     wsid: WorkerSetId,
-    registered_at: std::time::SystemTime,
     last_heartbeat_at: std::time::SystemTime,
     tx: Option<tokio::sync::oneshot::Sender<scheduler::Build>>,
     assigned_build: Option<u64>,
@@ -68,6 +67,10 @@ pub struct Queue {
     busy_workers: std::sync::atomic::AtomicU64,
     total_builds: std::sync::atomic::AtomicU64,
     total_workers: std::sync::atomic::AtomicU64,
+    max_builds: usize,
+    max_workers: usize,
+    max_buildsets: usize,
+    max_workersets: usize,
 
     builds: Mutex<HashMap<u64, Build>>,
     workers: Mutex<HashMap<u64, Worker>>,
@@ -175,6 +178,7 @@ fn get_or_create_build_set<'a>(
     buildsets: &'a mut HashMap<BuildSetID, BuildSet>,
     workersets: &mut HashMap<WorkerSetId, WorkerSet>,
     req: &[scheduler::Requirement],
+    max_buildsets: usize,
 ) -> Result<(BuildSetID, &'a mut BuildSet), tonic::Status> {
     let cons = req_into_constraints(req);
     let bsid: BuildSetID = setid_from_constraints(&cons).map_err(|err| {
@@ -182,6 +186,11 @@ fn get_or_create_build_set<'a>(
             "error generating a fingerprint for build requirements: {err:?}"
         ))
     })?;
+    if !buildsets.contains_key(&bsid) && buildsets.len() >= max_buildsets {
+        return Err(tonic::Status::resource_exhausted(format!(
+            "exceeded limit {max_buildsets} for groups of builds with unique requirements"
+        )));
+    }
     let bs = buildsets.entry(bsid).or_insert(BuildSet {
         requirements: cons,
         queue: VecDeque::new(),
@@ -197,6 +206,7 @@ fn get_or_create_worker_set(
     workersets: &mut HashMap<WorkerSetId, WorkerSet>,
     buildsets: &mut HashMap<BuildSetID, BuildSet>,
     res: &[scheduler::Resource],
+    max_workersets: usize,
 ) -> Result<WorkerSetId, tonic::Status> {
     let cons = res_into_constraints(res);
     let wsid = setid_from_constraints(&cons).map_err(|err| {
@@ -204,6 +214,11 @@ fn get_or_create_worker_set(
             "error generating a fingerprint for worker resources: {err:?}"
         ))
     })?;
+    if !workersets.contains_key(&wsid) && workersets.len() > max_workersets {
+        return Err(tonic::Status::resource_exhausted(format!(
+            "exceeded limit {max_workersets} for groups of workers with unique resources"
+        )));
+    }
     let mut inserted = false;
     let ws = workersets.entry(wsid).or_insert_with(|| {
         inserted = true;
@@ -452,6 +467,10 @@ impl Queue {
             busy_workers: 0.into(),
             total_builds: 0.into(),
             total_workers: 0.into(),
+            max_builds: 1_000_000,
+            max_workers: 1_000,
+            max_buildsets: 500,
+            max_workersets: 500,
             builds: Mutex::new(HashMap::new()),
             workers: Mutex::new(HashMap::new()),
             buildsets: Mutex::new(HashMap::new()),
@@ -530,10 +549,25 @@ impl Queue {
         }
     }
 
+    fn check_builds_quota(&self, builds: &HashMap<u64, Build>) -> Result<(), tonic::Status> {
+        if builds.len() > self.max_builds {
+            return Err(tonic::Status::resource_exhausted(format!(
+                "exceeded max builds capacity {}",
+                self.max_builds
+            )));
+        }
+        Ok(())
+    }
+
     pub fn create_build(&self, mut sbuild: scheduler::Build) -> Result<u64, tonic::Status> {
         let (mut buildsets, mut workersets, mut builds, mut workers) = self.grab_locks()?;
-        let (bsid, bs) =
-            get_or_create_build_set(&mut buildsets, &mut workersets, &sbuild.requirements)?;
+        self.check_builds_quota(&builds)?;
+        let (bsid, bs) = get_or_create_build_set(
+            &mut buildsets,
+            &mut workersets,
+            &sbuild.requirements,
+            self.max_buildsets,
+        )?;
         let build_id = self.next_build_id.fetch_add(1, Ordering::Relaxed);
         sbuild.id = build_id;
         let mut build = Build {
@@ -558,16 +592,27 @@ impl Queue {
         Ok(build_id)
     }
 
+    fn check_workers_quota(&self, workers: &HashMap<u64, Worker>) -> Result<(), tonic::Status> {
+        if workers.len() >= self.max_workers {
+            return Err(tonic::Status::resource_exhausted(format!(
+                "limit {} exceeded for active workers",
+                self.max_workers
+            )));
+        }
+        Ok(())
+    }
+
     pub fn register_worker(&self, res: &[scheduler::Resource]) -> Result<u64, tonic::Status> {
         let (mut buildsets, mut workersets, builds, mut workers) = self.grab_locks()?;
         drop(builds);
-        let wsid = get_or_create_worker_set(&mut workersets, &mut buildsets, res)?;
+        self.check_workers_quota(&workers)?;
+        let wsid =
+            get_or_create_worker_set(&mut workersets, &mut buildsets, res, self.max_workersets)?;
         let worker_id = self.next_worker_id.fetch_add(1, Ordering::Relaxed);
         workers.insert(
             worker_id,
             Worker {
                 wsid,
-                registered_at: std::time::SystemTime::now(),
                 last_heartbeat_at: std::time::SystemTime::now(),
                 tx: None,
                 assigned_build: None,
