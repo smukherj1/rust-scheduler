@@ -72,10 +72,10 @@ pub struct Queue {
     max_buildsets: usize,
     max_workersets: usize,
 
-    builds: Mutex<HashMap<u64, Build>>,
-    workers: Mutex<HashMap<u64, Worker>>,
-    buildsets: Mutex<HashMap<BuildSetID, BuildSet>>,
-    workersets: Mutex<HashMap<WorkerSetId, WorkerSet>>,
+    builds: Mutex<Builds>,
+    workers: Mutex<Workers>,
+    buildsets: Mutex<BuildSets>,
+    workersets: Mutex<WorkerSets>,
 }
 
 pub enum BuildResponse {
@@ -449,11 +449,15 @@ impl Build {
     }
 }
 
+type BuildSets = HashMap<BuildSetID, BuildSet>;
+type WorkerSets = HashMap<WorkerSetId, WorkerSet>;
+type Builds = HashMap<u64, Build>;
+type Workers = HashMap<u64, Worker>;
 type QueueLocks<'a> = (
-    MutexGuard<'a, HashMap<BuildSetID, BuildSet>>,
-    MutexGuard<'a, HashMap<WorkerSetId, WorkerSet>>,
-    MutexGuard<'a, HashMap<u64, Build>>,
-    MutexGuard<'a, HashMap<u64, Worker>>,
+    MutexGuard<'a, BuildSets>,
+    MutexGuard<'a, WorkerSets>,
+    MutexGuard<'a, Builds>,
+    MutexGuard<'a, Workers>,
 );
 
 impl Queue {
@@ -471,10 +475,10 @@ impl Queue {
             max_workers: 1_000,
             max_buildsets: 500,
             max_workersets: 500,
-            builds: Mutex::new(HashMap::new()),
-            workers: Mutex::new(HashMap::new()),
-            buildsets: Mutex::new(HashMap::new()),
-            workersets: Mutex::new(HashMap::new()),
+            builds: Mutex::new(Builds::new()),
+            workers: Mutex::new(Workers::new()),
+            buildsets: Mutex::new(BuildSets::new()),
+            workersets: Mutex::new(WorkerSets::new()),
         }
     }
 
@@ -489,7 +493,7 @@ impl Queue {
         }
     }
 
-    fn grab_builds_lock_inner(&self) -> Result<MutexGuard<HashMap<u64, Build>>, tonic::Status> {
+    fn grab_builds_lock_inner(&self) -> Result<MutexGuard<Builds>, tonic::Status> {
         let builds = self.builds.lock().map_err(|err| {
             tonic::Status::internal(format!(
                 "detected panic while trying to grab scheduler builds lock: {err:?}"
@@ -500,7 +504,7 @@ impl Queue {
         Ok(builds)
     }
 
-    fn grab_builds_lock(&self) -> Result<MutexGuard<HashMap<u64, Build>>, tonic::Status> {
+    fn grab_builds_lock(&self) -> Result<MutexGuard<Builds>, tonic::Status> {
         let _ = LockReporter::new("builds");
         self.grab_builds_lock_inner()
     }
@@ -549,7 +553,7 @@ impl Queue {
         }
     }
 
-    fn check_builds_quota(&self, builds: &HashMap<u64, Build>) -> Result<(), tonic::Status> {
+    fn check_builds_quota(&self, builds: &Builds) -> Result<(), tonic::Status> {
         if builds.len() > self.max_builds {
             return Err(tonic::Status::resource_exhausted(format!(
                 "exceeded max builds capacity {}",
@@ -592,7 +596,7 @@ impl Queue {
         Ok(build_id)
     }
 
-    fn check_workers_quota(&self, workers: &HashMap<u64, Worker>) -> Result<(), tonic::Status> {
+    fn check_workers_quota(&self, workers: &Workers) -> Result<(), tonic::Status> {
         if workers.len() >= self.max_workers {
             return Err(tonic::Status::resource_exhausted(format!(
                 "limit {} exceeded for active workers",

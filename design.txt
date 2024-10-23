@@ -99,7 +99,24 @@
  *   
  *
  * wait_build(bid)
- *
- * gc()
- *
  */
+
+ Garbage Collection
+ ------------------
+ * $WORKER_LOST_THRESHOLD = 30s
+ * Builds
+   * Transition to state "complete" with status "lost" if no heartbeat from worker for > $WORKER_LOST_THRESHOLD.
+   * Evictable from memory if completed > 1 min.
+
+ * Worker
+   * Transition to state "lost" if no heartbeat for > $WORKER_LOST_THRESHOLD and evict from memory failing
+     any assigned build.
+   * Remove from workerset.
+ 
+ * Workerset
+   * Evict if no active workers for over > 1 min.
+   * Remove from matching buildsets.
+ 
+ * Buildset
+   * Evict if no active builds for over > 1 min.
+   * Remove from matching workersets.
