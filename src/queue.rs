@@ -366,7 +366,7 @@ impl BuildSet {
         self.worker_set_ids.retain(|id| *id != *wsid);
     }
 
-    fn on_expiry(&self, bsid: &BuildSetID, workersets: &mut WorkerSets, builds: &mut Builds) {
+    fn on_expiry(&self, bsid: &BuildSetID, workersets: &mut WorkerSets) {
         for wsid in self.worker_set_ids.iter() {
             if let Some(ws) = workersets.get_mut(wsid) {
                 ws.remove_build_set(bsid);
@@ -374,18 +374,21 @@ impl BuildSet {
         }
     }
 
-    fn fail_unrunnable_builds(&mut self, builds: &mut Builds) {
+    fn fail_unrunnable_builds(&mut self, builds: &mut Builds) -> u64 {
         if !self.worker_set_ids.is_empty() {
-            return;
+            return 0;
         }
+        let mut result = 0;
         while let Some(build_id) = self.queue.pop_front() {
             let build = if let Some(build) = builds.get_mut(&build_id) {
                 build
             } else {
                 continue;
             };
+            result += 1;
             build.fail(tonic::Status::failed_precondition("no matching worker"));
         }
+        result
     }
 
     fn touch(&mut self) {
@@ -969,15 +972,23 @@ impl Queue {
         workersets: &mut WorkerSets,
         builds: &mut Builds,
     ) {
+        let mut unqueued_builds = 0u64;
         buildsets.retain(|bsid, bs| {
             if bs.expired() {
-                bs.on_expiry(bsid, workersets, builds);
+                bs.on_expiry(bsid, workersets);
                 return false;
             }
-            bs.fail_unrunnable_builds(builds);
+            unqueued_builds += bs.fail_unrunnable_builds(builds);
             bs.queue.retain(|build_id| builds.contains_key(build_id));
             true
         });
+        if self
+            .queued_builds
+            .fetch_sub(unqueued_builds, Ordering::Relaxed)
+            < unqueued_builds
+        {
+            self.queued_builds.store(0, Ordering::Relaxed);
+        }
     }
     fn gc_workersets(
         &self,
