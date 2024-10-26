@@ -72,7 +72,7 @@ async fn loadgen_task_inner(args: &Args, task_id: i32) -> Result<()> {
     }
     for b in builds {
         let timeout_ms_dur = args.build_dur_ms_upper_bound * (args.builds_per_worker as u64) + 100;
-        let timeout_ms_dur = timeout_ms_dur.max(5000);
+        let timeout_ms_dur = timeout_ms_dur.max(50000);
         let resp = tokio::time::timeout(
             tokio::time::Duration::from_millis(timeout_ms_dur),
             client.wait_build(scheduler::WaitBuildRequest { build_id: b.id }),

@@ -132,6 +132,30 @@ impl<'a> Drop for LockReporter<'a> {
     }
 }
 
+struct GCReporter {
+    begin: std::time::Instant,
+}
+
+impl GCReporter {
+    fn new() -> Self {
+        GCReporter {
+            begin: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for GCReporter {
+    fn drop(&mut self) {
+        metrics::GC_CYCLES.inc();
+        metrics::GC_LATENCY.observe(
+            std::time::Instant::now()
+                .checked_duration_since(self.begin)
+                .unwrap_or(Duration::from_millis(0))
+                .as_millis() as f64,
+        );
+    }
+}
+
 fn report_build_result(r: &scheduler::BuildResult) {
     let code = metrics::code_str(tonic::Code::from_i32(r.status));
     metrics::BUILDS_COMPLETED_COUNT
@@ -206,14 +230,22 @@ fn get_or_create_build_set<'a>(
             "exceeded limit {max_buildsets} for groups of builds with unique requirements"
         )));
     }
-    let bs = buildsets.entry(bsid).or_insert(BuildSet {
-        requirements: cons,
-        queue: VecDeque::new(),
-        worker_set_ids: Vec::new(),
-        last_touched: std::time::Instant::now(),
+    let mut inserted = false;
+    let bs = buildsets.entry(bsid).or_insert_with(|| {
+        inserted = true;
+        BuildSet {
+            requirements: cons,
+            queue: VecDeque::new(),
+            worker_set_ids: Vec::new(),
+            last_touched: std::time::Instant::now(),
+        }
     });
-    if bs.worker_set_ids.is_empty() {
+    if inserted {
         bs.add_compatible_worker_sets(&bsid, workersets)?;
+    } else if bs.worker_set_ids.is_empty() {
+        return Err(tonic::Status::failed_precondition(
+            "no available worker matches the given requirements",
+        ));
     } else {
         bs.touch();
     }
@@ -334,11 +366,25 @@ impl BuildSet {
         self.worker_set_ids.retain(|id| *id != *wsid);
     }
 
-    fn on_expiry(&self, bsid: &BuildSetID, workersets: &mut WorkerSets) {
+    fn on_expiry(&self, bsid: &BuildSetID, workersets: &mut WorkerSets, builds: &mut Builds) {
         for wsid in self.worker_set_ids.iter() {
             if let Some(ws) = workersets.get_mut(wsid) {
                 ws.remove_build_set(bsid);
             }
+        }
+    }
+
+    fn fail_unrunnable_builds(&mut self, builds: &mut Builds) {
+        if !self.worker_set_ids.is_empty() {
+            return;
+        }
+        while let Some(build_id) = self.queue.pop_front() {
+            let build = if let Some(build) = builds.get_mut(&build_id) {
+                build
+            } else {
+                continue;
+            };
+            build.fail(tonic::Status::failed_precondition("no matching worker"));
         }
     }
 
@@ -514,15 +560,10 @@ impl Build {
         Ok(())
     }
 
-    fn set_lost(&mut self, worker_id: u64) -> Result<()> {
-        let now = std::time::SystemTime::now();
-        self.completed_at = Some(now);
-        self.status = Some(tonic::Status::aborted(format!(
-            "assigned worker {worker_id} was lost",
-        )));
+    fn fail(&mut self, status: tonic::Status) {
+        self.completed_at = Some(std::time::SystemTime::now());
+        self.status = Some(status);
         self.state = BuildState::Complete;
-        self.verify_assignment(worker_id)?;
-        Ok(())
     }
 
     fn completed(&self) -> bool {
@@ -876,8 +917,14 @@ impl Queue {
     }
 
     fn gc_workers(&self, workers: &mut Workers, builds: &mut Builds) {
+        let (mut idle_workers, mut busy_workers) = (0u64, 0u64);
         workers.retain(|wid, worker| {
             if !worker.lost() {
+                if worker.assigned_build.is_some() {
+                    busy_workers += 1;
+                } else {
+                    idle_workers += 1;
+                }
                 return true;
             }
             let assigned_build = if let Some(build_id) = worker.assigned_build {
@@ -892,26 +939,42 @@ impl Queue {
                     return false;
                 },
             };
-            if let Err(err) = build.set_lost(*wid) {
-                eprintln!("Error: During garbage collection, unable to fail build {assigned_build} assigned to lost worker {wid}: {err:?}");
-            }
+            build.fail(tonic::Status::aborted(format!(
+                "assigned worker {wid} was lost",
+            )));
             false
         });
+        self.idle_workers.store(idle_workers, Ordering::Relaxed);
+        self.busy_workers.store(busy_workers, Ordering::Relaxed);
     }
     fn gc_builds(&self, builds: &mut Builds) {
-        builds.retain(|_, build| !build.expired());
+        let (mut queued_builds, mut running_builds) = (0u64, 0u64);
+        builds.retain(|_, build| {
+            if build.expired() {
+                return false;
+            }
+            match build.state {
+                BuildState::Queued => queued_builds += 1,
+                BuildState::Running => running_builds += 1,
+                BuildState::Complete => (),
+            }
+            true
+        });
+        self.queued_builds.store(queued_builds, Ordering::Relaxed);
+        self.running_builds.store(running_builds, Ordering::Relaxed);
     }
     fn gc_buildsets(
         &self,
         buildsets: &mut BuildSets,
         workersets: &mut WorkerSets,
-        builds: &Builds,
+        builds: &mut Builds,
     ) {
         buildsets.retain(|bsid, bs| {
             if bs.expired() {
-                bs.on_expiry(bsid, workersets);
+                bs.on_expiry(bsid, workersets, builds);
                 return false;
             }
+            bs.fail_unrunnable_builds(builds);
             bs.queue.retain(|build_id| builds.contains_key(build_id));
             true
         });
@@ -934,10 +997,11 @@ impl Queue {
     }
 
     pub fn gc(&self) -> Result<()> {
+        let _ = GCReporter::new();
         let (mut buildsets, mut workersets, mut builds, mut workers) = self.grab_locks()?;
         self.gc_workers(&mut workers, &mut builds);
         self.gc_builds(&mut builds);
-        self.gc_buildsets(&mut buildsets, &mut workersets, &builds);
+        self.gc_buildsets(&mut buildsets, &mut workersets, &mut builds);
         self.gc_workersets(&mut buildsets, &mut workersets, &workers);
         Ok(())
     }

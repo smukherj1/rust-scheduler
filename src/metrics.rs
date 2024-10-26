@@ -1,7 +1,8 @@
 use anyhow::Result;
 use once_cell::sync::Lazy;
 use prometheus::{
-    self, register_histogram_vec, register_int_counter_vec, register_int_gauge_vec, HistogramVec,
+    self, register_histogram, register_histogram_vec, register_int_counter,
+    register_int_counter_vec, register_int_gauge_vec, Histogram, HistogramVec, IntCounter,
     IntCounterVec, IntGaugeVec,
 };
 use tonic;
@@ -77,6 +78,23 @@ pub static LOCK_WAITERS: Lazy<IntGaugeVec> = Lazy::new(|| {
         "scheduler_lock_waiters",
         "Numer of concurrent threads waiting to acquire a scheduler lock by lock name",
         &["lock"],
+    )
+    .unwrap()
+});
+
+pub static GC_CYCLES: Lazy<IntCounter> = Lazy::new(|| {
+    register_int_counter!(
+        "scheduler_gc_cycles",
+        "Number of scheduler garbage collection cycles"
+    )
+    .unwrap()
+});
+
+pub static GC_LATENCY: Lazy<Histogram> = Lazy::new(|| {
+    register_histogram!(
+        "scheduler_gc_latency",
+        "Latency (ms) distribution of garbage collection cycles",
+        latency_buckets(20).unwrap(),
     )
     .unwrap()
 });
