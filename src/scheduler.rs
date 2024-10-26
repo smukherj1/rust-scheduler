@@ -292,6 +292,14 @@ async fn launch_scheduler_server(q: Arc<queue::Queue>, args: Arc<Args>) -> Resul
     Ok(())
 }
 
+async fn launch_gc(q: Arc<queue::Queue>) -> Result<()> {
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+        q.gc()
+            .with_context(|| "scheduler queue garbage collection failure")?;
+    }
+}
+
 fn validate_args(args: &Args) -> Result<()> {
     if args.address.is_empty() {
         anyhow::bail!("address flag can't be empty");
@@ -313,6 +321,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let margs = Arc::clone(&args);
     js.spawn(launch_metrics_server(margs));
     js.spawn(launch_scheduler_server(Arc::clone(&q), args));
+    js.spawn(launch_gc(Arc::clone(&q)));
     js.spawn(periodically_report_queue_metrics(q));
 
     while let Some(res) = js.join_next().await {

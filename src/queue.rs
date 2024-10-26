@@ -13,10 +13,22 @@ pub mod scheduler {
     tonic::include_proto!("scheduler");
 }
 
+const WORKER_LOST_THRESHOLD_SECONDS: u64 = 60;
+const BUILD_EXPIRED_THRESHOLD_SECONDS: u64 = 60;
+const WORKER_SET_EXPIRY_THRESHOLD_SECONDS: u64 = 60;
+const BUILD_SET_EXPIRY_THRESHOLD_SECONDS: u64 = 60;
+
 type Constraints = HashMap<String, String>;
 type SetID = [u8; 32];
 type BuildSetID = SetID;
-type WorkerSetId = SetID;
+type WorkerSetID = SetID;
+
+#[derive(Eq, PartialEq)]
+enum BuildState {
+    Queued,
+    Running,
+    Complete,
+}
 
 struct Build {
     bsid: BuildSetID,
@@ -26,12 +38,13 @@ struct Build {
     last_heartbeat_at: Option<std::time::SystemTime>,
     completed_at: Option<std::time::SystemTime>,
     status: Option<tonic::Status>,
+    state: BuildState,
     tx: Option<tokio::sync::oneshot::Sender<scheduler::BuildResult>>,
     proto: scheduler::Build,
 }
 
 struct Worker {
-    wsid: WorkerSetId,
+    wsid: WorkerSetID,
     last_heartbeat_at: std::time::SystemTime,
     tx: Option<tokio::sync::oneshot::Sender<scheduler::Build>>,
     assigned_build: Option<u64>,
@@ -40,13 +53,15 @@ struct Worker {
 struct BuildSet {
     requirements: Constraints,
     queue: VecDeque<u64>,
-    worker_set_ids: Vec<WorkerSetId>,
+    worker_set_ids: Vec<WorkerSetID>,
+    last_touched: std::time::Instant,
 }
 
 struct WorkerSet {
     resources: Constraints,
     waiting_worker_ids: VecDeque<u64>,
     build_set_ids: Vec<BuildSetID>,
+    last_touched: std::time::Instant,
 }
 
 pub struct QueueStats {
@@ -176,7 +191,7 @@ fn is_compatible(req: &HashMap<String, String>, res: &HashMap<String, String>) -
 
 fn get_or_create_build_set<'a>(
     buildsets: &'a mut HashMap<BuildSetID, BuildSet>,
-    workersets: &mut HashMap<WorkerSetId, WorkerSet>,
+    workersets: &mut HashMap<WorkerSetID, WorkerSet>,
     req: &[scheduler::Requirement],
     max_buildsets: usize,
 ) -> Result<(BuildSetID, &'a mut BuildSet), tonic::Status> {
@@ -195,19 +210,22 @@ fn get_or_create_build_set<'a>(
         requirements: cons,
         queue: VecDeque::new(),
         worker_set_ids: Vec::new(),
+        last_touched: std::time::Instant::now(),
     });
     if bs.worker_set_ids.is_empty() {
         bs.add_compatible_worker_sets(&bsid, workersets)?;
+    } else {
+        bs.touch();
     }
     Ok((bsid, bs))
 }
 
 fn get_or_create_worker_set(
-    workersets: &mut HashMap<WorkerSetId, WorkerSet>,
+    workersets: &mut HashMap<WorkerSetID, WorkerSet>,
     buildsets: &mut HashMap<BuildSetID, BuildSet>,
     res: &[scheduler::Resource],
     max_workersets: usize,
-) -> Result<WorkerSetId, tonic::Status> {
+) -> Result<WorkerSetID, tonic::Status> {
     let cons = res_into_constraints(res);
     let wsid = setid_from_constraints(&cons).map_err(|err| {
         tonic::Status::internal(format!(
@@ -226,11 +244,14 @@ fn get_or_create_worker_set(
             resources: cons,
             waiting_worker_ids: VecDeque::new(),
             build_set_ids: Vec::new(),
+            last_touched: std::time::Instant::now(),
         }
     });
 
     if inserted {
         ws.add_compatible_build_sets(&wsid, buildsets);
+    } else {
+        ws.touch();
     }
     Ok(wsid)
 }
@@ -238,7 +259,7 @@ fn get_or_create_worker_set(
 fn try_assign_build(
     build: &scheduler::Build,
     bs: &BuildSet,
-    workersets: &mut HashMap<WorkerSetId, WorkerSet>,
+    workersets: &mut HashMap<WorkerSetID, WorkerSet>,
     workers: &mut HashMap<u64, Worker>,
 ) -> Option<u64> {
     let build_id = build.id;
@@ -246,20 +267,20 @@ fn try_assign_build(
         let ws = if let Some(ws) = workersets.get_mut(wsid) {
             ws
         } else {
-            println!("ERROR: Found non-existent worker set in build set while trying to assign build {build_id}: worker_set {wsid:?}");
+            println!("ERROR: Found non-existent worker set in build set while trying to assign build {build_id}: worker_set {wsid:x?}");
             continue;
         };
         while let Some(wid) = ws.waiting_worker_ids.pop_front() {
             let w = if let Some(w) = workers.get_mut(&wid) {
                 w
             } else {
-                println!("ERROR: Found invalid worker ID {wid} in worker set {wsid:?} while trying to assign build {build_id}");
+                println!("ERROR: Found invalid worker ID {wid} in worker set {wsid:x?} while trying to assign build {build_id}");
                 continue;
             };
             let assigned = match w.try_assign_build(build) {
                 Ok(a) => a,
                 Err(err) => {
-                    println!("ERROR: Unable to assign build {build_id} to worker {wid} in worker set {wsid:?}: {err:?}");
+                    println!("ERROR: Unable to assign build {build_id} to worker {wid} in worker set {wsid:x?}: {err:?}");
                     continue;
                 }
             };
@@ -272,11 +293,27 @@ fn try_assign_build(
     None
 }
 
+fn touch_build_set(bsid: &BuildSetID, buildsets: &mut BuildSets) -> Result<(), tonic::Status> {
+    let bs = buildsets
+        .get_mut(bsid)
+        .ok_or_else(|| tonic::Status::internal(format!("invalid build set id {bsid:x?}")))?;
+    bs.touch();
+    Ok(())
+}
+
+fn touch_worker_set(wsid: &WorkerSetID, workersets: &mut WorkerSets) -> Result<(), tonic::Status> {
+    let ws = workersets
+        .get_mut(wsid)
+        .ok_or_else(|| tonic::Status::internal(format!("invalid worker set id {wsid:x?}")))?;
+    ws.touch();
+    Ok(())
+}
+
 impl BuildSet {
     fn add_compatible_worker_sets(
         &mut self,
         bsid: &BuildSetID,
-        workersets: &mut HashMap<WorkerSetId, WorkerSet>,
+        workersets: &mut HashMap<WorkerSetID, WorkerSet>,
     ) -> Result<(), tonic::Status> {
         for (wsid, ws) in workersets.iter_mut() {
             if !is_compatible(&self.requirements, &ws.resources) {
@@ -292,12 +329,37 @@ impl BuildSet {
         }
         Ok(())
     }
+
+    fn remove_worker_set(&mut self, wsid: &WorkerSetID) {
+        self.worker_set_ids.retain(|id| *id != *wsid);
+    }
+
+    fn on_expiry(&self, bsid: &BuildSetID, workersets: &mut WorkerSets) {
+        for wsid in self.worker_set_ids.iter() {
+            if let Some(ws) = workersets.get_mut(wsid) {
+                ws.remove_build_set(bsid);
+            }
+        }
+    }
+
+    fn touch(&mut self) {
+        self.last_touched = std::time::Instant::now();
+    }
+
+    fn expired(&self) -> bool {
+        self.queue.is_empty()
+            && std::time::Instant::now()
+                .checked_duration_since(self.last_touched)
+                .unwrap_or(Duration::from_secs(0))
+                .as_secs()
+                > BUILD_SET_EXPIRY_THRESHOLD_SECONDS
+    }
 }
 
 impl WorkerSet {
     fn add_compatible_build_sets(
         &mut self,
-        wsid: &WorkerSetId,
+        wsid: &WorkerSetID,
         buildsets: &mut HashMap<BuildSetID, BuildSet>,
     ) {
         for (bsid, bs) in buildsets.iter_mut() {
@@ -306,6 +368,18 @@ impl WorkerSet {
             }
             self.build_set_ids.push(*bsid);
             bs.worker_set_ids.push(*wsid);
+        }
+    }
+
+    fn remove_build_set(&mut self, bsid: &BuildSetID) {
+        self.build_set_ids.retain(|id| *id != *bsid);
+    }
+
+    fn on_expiry(&self, wsid: &WorkerSetID, buildsets: &mut BuildSets) {
+        for bsid in self.build_set_ids.iter() {
+            if let Some(bs) = buildsets.get_mut(bsid) {
+                bs.remove_worker_set(wsid);
+            }
         }
     }
 
@@ -320,6 +394,18 @@ impl WorkerSet {
 
     fn remove_available_worker(&mut self, worker_id: u64) {
         self.waiting_worker_ids.retain(|id| *id != worker_id);
+    }
+
+    fn touch(&mut self) {
+        self.last_touched = std::time::Instant::now();
+    }
+
+    fn expired(&self) -> bool {
+        std::time::Instant::now()
+            .checked_duration_since(self.last_touched)
+            .unwrap_or(Duration::from_secs(0))
+            .as_secs()
+            > WORKER_SET_EXPIRY_THRESHOLD_SECONDS
     }
 }
 
@@ -369,6 +455,13 @@ impl Worker {
         }
         Ok(())
     }
+
+    fn lost(&self) -> bool {
+        if let Ok(dur) = self.last_heartbeat_at.elapsed() {
+            return dur.as_secs() > WORKER_LOST_THRESHOLD_SECONDS;
+        }
+        false
+    }
 }
 
 impl Build {
@@ -402,6 +495,7 @@ impl Build {
         }
         self.completed_at = Some(now);
         self.status = Some(tonic::Status::new(tonic::Code::from_i32(status), details));
+        self.state = BuildState::Complete;
         Ok(())
     }
 
@@ -415,12 +509,24 @@ impl Build {
             self.assigned_at = Some(now);
             self.assigned_worker = Some(worker_id);
             self.last_heartbeat_at = Some(now);
+            self.state = BuildState::Running;
         }
         Ok(())
     }
 
+    fn set_lost(&mut self, worker_id: u64) -> Result<()> {
+        let now = std::time::SystemTime::now();
+        self.completed_at = Some(now);
+        self.status = Some(tonic::Status::aborted(format!(
+            "assigned worker {worker_id} was lost",
+        )));
+        self.state = BuildState::Complete;
+        self.verify_assignment(worker_id)?;
+        Ok(())
+    }
+
     fn completed(&self) -> bool {
-        self.status.is_some()
+        self.state == BuildState::Complete
     }
 
     fn result(&self) -> scheduler::BuildResult {
@@ -447,10 +553,21 @@ impl Build {
             details: status.message().to_string(),
         }
     }
+
+    fn expired(&self) -> bool {
+        if let Some(completed_at) = self.completed_at {
+            return completed_at
+                .elapsed()
+                .unwrap_or(std::time::Duration::from_secs(0))
+                .as_secs()
+                > BUILD_EXPIRED_THRESHOLD_SECONDS;
+        }
+        false
+    }
 }
 
 type BuildSets = HashMap<BuildSetID, BuildSet>;
-type WorkerSets = HashMap<WorkerSetId, WorkerSet>;
+type WorkerSets = HashMap<WorkerSetID, WorkerSet>;
 type Builds = HashMap<u64, Build>;
 type Workers = HashMap<u64, Worker>;
 type QueueLocks<'a> = (
@@ -582,6 +699,7 @@ impl Queue {
             last_heartbeat_at: None,
             completed_at: None,
             status: None,
+            state: BuildState::Queued,
             tx: None,
             proto: sbuild,
         };
@@ -648,14 +766,15 @@ impl Queue {
         }
         let ws = workersets.get_mut(&w.wsid).ok_or_else(|| {
             tonic::Status::internal(format!(
-                "worker id {worker_id} referenced non-existent worker set with id {:?}",
+                "worker id {worker_id} referenced non-existent worker set with id {:x?}",
                 w.wsid
             ))
         })?;
+        ws.touch();
         for bsid in ws.build_set_ids.iter() {
             let bs = buildsets.get_mut(bsid).ok_or_else(|| {
                 tonic::Status::internal(format!(
-                    "worker set for worker id {worker_id} referenced non-existent build set with id {:?}",
+                    "worker set for worker id {worker_id} referenced non-existent build set with id {:x?}",
                     bsid,
                 ))
             })?;
@@ -664,6 +783,7 @@ impl Queue {
             } else {
                 continue;
             };
+            bs.touch();
             let b = builds.get_mut(&build_id).ok_or_else(|| {
                 tonic::Status::internal(format!(
                     "popped non-existent build id {build_id:?} from internal queue"
@@ -702,8 +822,7 @@ impl Queue {
         status: i32,
         details: String,
     ) -> Result<(), tonic::Status> {
-        let (buildsets, mut workersets, mut builds, mut workers) = self.grab_locks()?;
-        drop(buildsets);
+        let (mut buildsets, mut workersets, mut builds, mut workers) = self.grab_locks()?;
         let build = builds.get_mut(&build_id).ok_or_else(|| {
             tonic::Status::invalid_argument(format!("build id {build_id} is invalid in heartbeat request from worker {worker_id}, done={done}"))
         })?;
@@ -716,6 +835,12 @@ impl Queue {
         worker.on_heartbeat(build_id, done).map_err(|err| {
             tonic::Status::new(err.code(), format!("unable to record heartbeat on worker {worker_id} for build {build_id}, done={done}: {err:?}"))
         })?;
+        touch_build_set(&build.bsid, &mut buildsets).map_err(|err| {
+            tonic::Status::new(err.code(), format!("unable to record heartbeat on build {build_id} from worker {worker_id}, done={done}: {err:?}"))
+        })?;
+        touch_worker_set(&worker.wsid, &mut workersets).map_err(|err| {
+            tonic::Status::new(err.code(), format!("unable to record heartbeat on build {build_id} from worker {worker_id}, done={done}: {err:?}"))
+        })?;
         if !done {
             return Ok(());
         }
@@ -726,7 +851,7 @@ impl Queue {
         }
         let ws = workersets.get_mut(&worker.wsid).ok_or_else(|| {
             tonic::Status::internal(format!(
-                "worker id {worker_id} contained non-existent worker set id {:?}",
+                "worker id {worker_id} contained non-existent worker set id {:x?}",
                 worker.wsid
             ))
         })?;
@@ -748,6 +873,73 @@ impl Queue {
         let (tx, rx) = tokio::sync::oneshot::channel();
         build.tx = Some(tx);
         Ok(BuildResultResponse::WaitChannel(rx))
+    }
+
+    fn gc_workers(&self, workers: &mut Workers, builds: &mut Builds) {
+        workers.retain(|wid, worker| {
+            if !worker.lost() {
+                return true;
+            }
+            let assigned_build = if let Some(build_id) = worker.assigned_build {
+                build_id
+            } else {
+                return false;
+            };
+            let build = match builds.get_mut(&assigned_build) {
+                Some(build) => build,
+                None => {
+                    eprintln!("Error: During garbage collection, found worker {wid} assigned to non-existent build {assigned_build}.");
+                    return false;
+                },
+            };
+            if let Err(err) = build.set_lost(*wid) {
+                eprintln!("Error: During garbage collection, unable to fail build {assigned_build} assigned to lost worker {wid}: {err:?}");
+            }
+            false
+        });
+    }
+    fn gc_builds(&self, builds: &mut Builds) {
+        builds.retain(|_, build| !build.expired());
+    }
+    fn gc_buildsets(
+        &self,
+        buildsets: &mut BuildSets,
+        workersets: &mut WorkerSets,
+        builds: &Builds,
+    ) {
+        buildsets.retain(|bsid, bs| {
+            if bs.expired() {
+                bs.on_expiry(bsid, workersets);
+                return false;
+            }
+            bs.queue.retain(|build_id| builds.contains_key(build_id));
+            true
+        });
+    }
+    fn gc_workersets(
+        &self,
+        buildsets: &mut BuildSets,
+        workersets: &mut WorkerSets,
+        workers: &Workers,
+    ) {
+        workersets.retain(|wsid, ws| {
+            if ws.expired() {
+                ws.on_expiry(wsid, buildsets);
+                return false;
+            }
+            ws.waiting_worker_ids
+                .retain(|worker_id| workers.contains_key(worker_id));
+            true
+        });
+    }
+
+    pub fn gc(&self) -> Result<()> {
+        let (mut buildsets, mut workersets, mut builds, mut workers) = self.grab_locks()?;
+        self.gc_workers(&mut workers, &mut builds);
+        self.gc_builds(&mut builds);
+        self.gc_buildsets(&mut buildsets, &mut workersets, &builds);
+        self.gc_workersets(&mut buildsets, &mut workersets, &workers);
+        Ok(())
     }
 }
 
