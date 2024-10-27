@@ -294,7 +294,7 @@ async fn launch_scheduler_server(q: Arc<queue::Queue>, args: Arc<Args>) -> Resul
 
 async fn launch_gc(q: Arc<queue::Queue>) -> Result<()> {
     loop {
-        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
         q.gc()
             .with_context(|| "scheduler queue garbage collection failure")?;
     }

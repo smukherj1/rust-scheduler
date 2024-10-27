@@ -13,10 +13,10 @@ pub mod scheduler {
     tonic::include_proto!("scheduler");
 }
 
-const WORKER_LOST_THRESHOLD_SECONDS: u64 = 60;
-const BUILD_EXPIRED_THRESHOLD_SECONDS: u64 = 60;
-const WORKER_SET_EXPIRY_THRESHOLD_SECONDS: u64 = 60;
-const BUILD_SET_EXPIRY_THRESHOLD_SECONDS: u64 = 60;
+const WORKER_LOST_THRESHOLD_SECONDS: u64 = 12;
+const BUILD_EXPIRED_THRESHOLD_SECONDS: u64 = 20;
+const WORKER_SET_EXPIRY_THRESHOLD_SECONDS: u64 = 20;
+const BUILD_SET_EXPIRY_THRESHOLD_SECONDS: u64 = 10;
 
 type Constraints = HashMap<String, String>;
 type SetID = [u8; 32];
@@ -567,6 +567,7 @@ impl Build {
         self.completed_at = Some(std::time::SystemTime::now());
         self.status = Some(status);
         self.state = BuildState::Complete;
+        report_build_result(&self.result());
     }
 
     fn completed(&self) -> bool {

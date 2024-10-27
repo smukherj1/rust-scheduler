@@ -112,13 +112,14 @@ async fn loadgen_task_inner(args: &Args, task_id: i32) -> Result<()> {
         } else {
             0
         };
-
-        if status.code() != tonic::Code::Ok || b.id % 1000 == 0 || queued_ms > 10000 {
-            println!(
-                "Task {task_id}, build {}, sleep_ms {}, completed with status {} {}, queued_ms {queued_ms}, exec_ms {exec_ms}",
-                b.id, b.sleep_ms, status.code(), status.message(),
-            );
-        }
+        /*
+                if status.code() != tonic::Code::Ok || b.id % 1000 == 0 || queued_ms > 10000 {
+                    println!(
+                        "Task {task_id}, build {}, sleep_ms {}, completed with status {} {}, queued_ms {queued_ms}, exec_ms {exec_ms}",
+                        b.id, b.sleep_ms, status.code(), status.message(),
+                    );
+                }
+        */
     }
     // println!("Load generator task {task_id} is exiting.");
     Ok(())
